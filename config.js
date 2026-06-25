@@ -10,7 +10,7 @@ window.APP_CONFIG = {
   // Isi sesuai bucket yang sudah kamu buat di Supabase.
   // Isi nama bucket Storage kamu di Supabase (Supabase → Storage → buat bucket baru, contoh: "evora-assets")
   // Kalau belum punya bucket, buat dulu di dashboard Supabase dengan visibility PUBLIC
-  SUPABASE_ASSET_BUCKET: "ganti_dengan_nama_bucket_kamu",
+  SUPABASE_ASSET_BUCKET: "menu-images",
   // untuk magic-link redirect
   SITE_URL: window.location.origin,
 };
