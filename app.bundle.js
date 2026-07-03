@@ -1,6 +1,7 @@
 var DonatBoss = (() => {
   var { useState, useEffect, useCallback, useMemo, useRef } = React;
   var sb = window.sb;
+  var APP_BOOT_ERROR = String(window.__APP_BOOT_ERROR || "").trim();
 
   // ─── Owner nav: dipakai bersama oleh App (sidebar) & OwnerPage (konten) ───
   var OWNER_TABS = [
@@ -182,6 +183,10 @@ var DonatBoss = (() => {
   // ─── Formatters ────────────────────────────────────────────────────────────
   var fmtRp = (n) => "Rp " + Number(n || 0).toLocaleString("id-ID");
   var today = () => { const d = new Date(); d.setHours(d.getHours() + 7); return d.toISOString().slice(0, 10); };
+  var startOfMonth = (dateStr) => {
+    const base = dateStr || today();
+    return String(base).slice(0, 7) + "-01";
+  };
   var nowTs = () => new Date().toLocaleString("id-ID");
   var nowIso = () => new Date().toISOString();
 
@@ -298,7 +303,28 @@ var DonatBoss = (() => {
   var setBrandLogoLocal = (url) => { try { if (url) localStorage.setItem("branding_logo_url", url); } catch {} };
   var HISTORY_MODE_STORAGE_KEY = "history_mode_config";
   var HISTORY_MODE_DB_KEY = "history_mode";
+  var JADWAL_LIBUR_DB_KEY = "jadwal_libur";
+  var JADWAL_LIBUR_ALLOWED_DAYS = new Set(["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"]);
+  var isActiveProfile = (profile) => !!profile && profile.role !== "none" && profile.status !== "deleted" && !profile.deleted_at && !profile.deletedAt;
   var getHistoryModeDefault = () => ({ enabled: false, scope: "global", branchIds: [] });
+  var getJadwalLiburDefault = () => ({});
+  var normalizeJadwalLibur = (value) => {
+    const raw = value && typeof value === "object" ? value : {};
+    return Object.fromEntries(
+      Object.entries(raw)
+        .map(([userId, hari]) => [String(userId || "").trim(), String(hari || "").trim()])
+        .filter(([userId, hari]) => userId && (!hari || JADWAL_LIBUR_ALLOWED_DAYS.has(hari)))
+    );
+  };
+  var getJadwalLiburLocal = () => {
+    try { return normalizeJadwalLibur(JSON.parse(localStorage.getItem("jadwalLibur") || "null")); }
+    catch { return getJadwalLiburDefault(); }
+  };
+  var setJadwalLiburLocal = (value) => {
+    const cfg = normalizeJadwalLibur(value);
+    try { localStorage.setItem("jadwalLibur", JSON.stringify(cfg)); } catch {}
+    return cfg;
+  };
   var normalizeHistoryMode = (value) => {
     const raw = value && typeof value === "object" ? value : {};
     const scope = raw.scope === "selected" ? "selected" : "global";
@@ -328,6 +354,21 @@ var DonatBoss = (() => {
     const { error } = await sb.from("app_settings").upsert({ key: HISTORY_MODE_DB_KEY, value: cfg });
     if (error) throw error;
     return setHistoryModeLocal(cfg);
+  };
+  var syncJadwalLiburFromDb = async () => {
+    try {
+      const { data, error } = await sb.from("app_settings").select("value").eq("key", JADWAL_LIBUR_DB_KEY).maybeSingle();
+      if (error) throw error;
+      return setJadwalLiburLocal(data?.value || getJadwalLiburDefault());
+    } catch {
+      return getJadwalLiburLocal();
+    }
+  };
+  var saveJadwalLiburToDb = async (value) => {
+    const cfg = normalizeJadwalLibur(value);
+    const { error } = await sb.from("app_settings").upsert({ key: JADWAL_LIBUR_DB_KEY, value: cfg });
+    if (error) throw error;
+    return setJadwalLiburLocal(cfg);
   };
   var isHistoryModeAllowedForBranch = (value, branchId) => {
     const cfg = normalizeHistoryMode(value);
@@ -490,50 +531,101 @@ var DonatBoss = (() => {
   }
 
   // ─── ConfirmModal — dialog konfirmasi generik (terutama untuk Hapus) ───────
-  function ConfirmModal({ title, message, confirmLabel, onConfirm, onCancel, danger }) {
-    return React.createElement("div", { className: "modal-backdrop", onClick: onCancel },
-      React.createElement("div", { className: "modal-box modal-box-sm", onClick: (e) => e.stopPropagation() },
-        React.createElement("div", { className: "modal-header" }, title || "Konfirmasi"),
-        React.createElement("div", { className: "modal-body" },
-          React.createElement("p", null, message || "Apakah Anda yakin?"),
-          React.createElement("div", { className: "row-wrap", style: { justifyContent: "flex-end", marginTop: 8 } },
-            React.createElement("button", { className: "btn-secondary", onClick: onCancel }, "Batal"),
-            React.createElement("button", { className: danger === false ? "btn-primary" : "btn-danger-confirm", onClick: onConfirm }, confirmLabel || "Ya, Hapus")
-          )
+function ConfirmModal({ title, message, confirmLabel, onConfirm, onCancel, danger, confirmBusy, requireText, textLabel, textPlaceholder, initialText, textHelp }) {
+  const [text, setText] = useState(initialText || "");
+  useEffect(() => { setText(initialText || ""); }, [initialText, title, message]);
+  const mustFillText = !!requireText;
+  const isConfirmDisabled = !!confirmBusy || (mustFillText && !String(text || "").trim());
+  return React.createElement("div", { className: "modal-backdrop", onClick: () => !confirmBusy && onCancel && onCancel() },
+    React.createElement("div", { className: "modal-box modal-box-sm", onClick: (e) => e.stopPropagation() },
+      React.createElement("div", { className: "modal-header" }, title || "Konfirmasi"),
+      React.createElement("div", { className: "modal-body" },
+        React.createElement("p", { style: { whiteSpace: "pre-line" } }, message || "Apakah Anda yakin?"),
+        mustFillText && React.createElement("div", { className: "field-group", style: { marginTop: 10 } },
+          React.createElement("label", null, textLabel || "Alasan"),
+          React.createElement("textarea", {
+            className: "inp",
+            rows: 3,
+            value: text,
+            placeholder: textPlaceholder || "Tulis alasan singkat...",
+            onChange: (e) => setText(e.target.value),
+            disabled: !!confirmBusy,
+            style: { resize: "vertical", minHeight: 88 }
+          }),
+          textHelp && React.createElement("div", { className: "info-txt mt8" }, textHelp)
+        ),
+        React.createElement("div", { className: "row-wrap", style: { justifyContent: "flex-end", marginTop: 8 } },
+          React.createElement("button", { className: "btn-secondary", onClick: onCancel, disabled: !!confirmBusy }, "Batal"),
+          React.createElement("button", {
+            className: danger === false ? "btn-primary" : "btn-danger-confirm",
+            onClick: () => onConfirm && onConfirm(text),
+            disabled: isConfirmDisabled
+          }, confirmBusy ? "Memproses..." : (confirmLabel || "Ya, Hapus"))
         )
       )
-    );
-  }
+    )
+  );
+}
 
-  // ─── DateField — kotak custom menampilkan "Jum, 26 Jun 2026" langsung di
-  // dalamnya. Input <input type="date"> native ditumpuk transparan di atas
-  // supaya tap di kotak ini membuka date-picker bawaan device, tanpa perlu
-  // bikin calendar widget sendiri (lebih aman & familiar untuk user).
-  function DateField({ value, onChange, className }) {
-    return React.createElement("div", { className: "date-field" },
-      React.createElement("input", { type: "date", className: "date-field-input", value: value, onChange }),
-      React.createElement("div", { className: className ? className + " date-field-display" : "inp inp-sm date-field-display" },
-        React.createElement("span", { className: "date-field-icon" }, "\uD83D\uDCC5"),
-        React.createElement("span", null, formatTanggalIndoPendek(value))
-      )
-    );
-  }
+// ─── DateField — kotak custom menampilkan "Jum, 26 Jun 2026" langsung di
+// dalamnya. Input <input type="date"> native ditumpuk transparan di atas
+// supaya tap di kotak ini membuka date-picker bawaan device, tanpa perlu
+// bikin calendar widget sendiri (lebih aman & familiar untuk user).
+function DateField({ value, onChange, className }) {
+  return React.createElement("div", { className: "date-field" },
+    React.createElement("input", { type: "date", className: "date-field-input", value: value, onChange }),
+    React.createElement("div", { className: className ? className + " date-field-display" : "inp inp-sm date-field-display" },
+      React.createElement("span", { className: "date-field-icon" }, "\uD83D\uDCC5"),
+      React.createElement("span", null, formatTanggalIndoPendek(value))
+    )
+  );
+}
 
-  // ─── useConfirm — hook kecil untuk memunculkan ConfirmModal dengan mudah ───
-  // Pakai: const confirm = useConfirm(); confirm({ message, onConfirm });
-  function useConfirm() {
-    const [state, setState] = useState(null);
-    const ask = useCallback((opts) => setState(opts), []);
-    const modal = state && React.createElement(ConfirmModal, {
-      title: state.title,
-      message: state.message,
-      confirmLabel: state.confirmLabel,
-      danger: state.danger,
-      onCancel: () => setState(null),
-      onConfirm: () => { state.onConfirm(); setState(null); }
-    });
-    return [ask, modal];
-  }
+// ─── useConfirm — hook kecil untuk memunculkan ConfirmModal dengan mudah ───
+// Pakai: const confirm = useConfirm(); confirm({ message, onConfirm });
+function useConfirm() {
+  const [state, setState] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const ask = useCallback((opts) => {
+    setBusy(false);
+    setState(opts);
+  }, []);
+  const handleCancel = useCallback(() => {
+    if (busy) return;
+    setState(null);
+  }, [busy]);
+  const handleConfirm = useCallback(async (textValue) => {
+    if (!state?.onConfirm) { setState(null); return; }
+    let shouldClose = true;
+    try {
+      const result = state.onConfirm(textValue);
+      if (result && typeof result.then === "function") {
+        setBusy(true);
+        await result;
+      }
+    } catch (err) {
+      shouldClose = false;
+    } finally {
+      setBusy(false);
+      if (shouldClose) setState(null);
+    }
+  }, [state]);
+  const modal = state && React.createElement(ConfirmModal, {
+    title: state.title,
+    message: state.message,
+    confirmLabel: state.confirmLabel,
+    danger: state.danger,
+    requireText: state.requireText,
+    textLabel: state.textLabel,
+    textPlaceholder: state.textPlaceholder,
+    initialText: state.initialText,
+    textHelp: state.textHelp,
+    confirmBusy: busy,
+    onCancel: handleCancel,
+    onConfirm: handleConfirm
+  });
+  return [ask, modal];
+}
 
   function BarChart({ data, height }) {
     const max = Math.max(...data.map((d) => Math.max(d.v1 || 0, d.v2 || 0)), 1);
@@ -556,6 +648,7 @@ var DonatBoss = (() => {
     const [password, setPassword] = useState("");
     const [err, setErr] = useState("");
     const [busy, setBusy] = useState(false);
+    const [showPassword, setShowPassword] = useState(false);
 
     const doLogin = async () => {
       setErr("");
@@ -584,7 +677,10 @@ var DonatBoss = (() => {
         ),
         React.createElement("div", { className: "field-group", style: { marginTop: 8 } },
           React.createElement("label", null, "Kata Sandi"),
-          React.createElement("input", { className: "inp", type: "password", value: password, onChange: (e) => setPassword(e.target.value), onKeyDown: (e) => e.key === "Enter" && doLogin(), placeholder: "Masukkan kata sandi..." })
+          React.createElement("div", { style: { position: "relative", display: "flex", alignItems: "center" } },
+            React.createElement("input", { className: "inp", type: showPassword ? "text" : "password", value: password, onChange: (e) => setPassword(e.target.value), onKeyDown: (e) => e.key === "Enter" && doLogin(), placeholder: "Masukkan kata sandi..." }),
+            React.createElement("button", { type: "button", style: { position: "absolute", right: 10, background: "none", border: "none", color: "var(--text2)", cursor: "pointer", fontSize: 11, fontWeight: "700" }, onClick: () => setShowPassword(!showPassword) }, showPassword ? "SEMBUNYIKAN" : "LIHAT")
+          )
         ),
         err && React.createElement("p", { style: { color: "var(--red)", fontSize: 13, marginTop: 4 } }, err),
         React.createElement("button", { className: "btn-primary btn-full", onClick: doLogin, disabled: busy, style: { marginTop: 12 } }, busy ? "Memverifikasi..." : "Masuk"),
@@ -742,7 +838,7 @@ var DonatBoss = (() => {
     // REVISI #2: editModal hanya dipakai kalau mode === "owner"
     const [editModal, setEditModal] = useState(null);
     const userId = me?.user_id;
-    const profiles = mode === "owner" ? (S.get("profiles") || []) : [];
+    const profiles = mode === "owner" ? (S.get("profiles") || []).filter(isActiveProfile) : [];
 
     useEffect(() => {
       setBranches(S.get("branches") || []);
@@ -1702,7 +1798,7 @@ var DonatBoss = (() => {
   }
   // ─── OwnerDashboard ────────────────────────────────────────────────────────
   function OwnerDashboard() {
-    const [dr, setDr] = useState({ from: today(), to: today() });
+    const [dr, setDr] = useState({ from: startOfMonth(), to: today() });
     const [selBranch, setSelBranch] = useState("all");
     const [expandedBranch, setExpandedBranch] = useState(null);
     const [kpiDetail, setKpiDetail] = useState(null);
@@ -2411,7 +2507,7 @@ var DonatBoss = (() => {
     const [selBranch, setSelBranch] = useState("all");
     const [busyGaji, setBusyGaji] = useState({});
     const branches = S.get("branches") || [];
-    const profiles = S.get("profiles") || [];
+    const profiles = (S.get("profiles") || []).filter(isActiveProfile);
     const absensi = S.get("absensi") || [];
     const snaps = S.get("absensiBulanan") || [];
     const gajiPembayaran = S.get("gajiPembayaran") || [];
@@ -3078,149 +3174,429 @@ var DonatBoss = (() => {
   }
 
   // ─── SettingAkun ───────────────────────────────────────────────────────────
-  function SettingAkun({ pushNotif }) {
-    const tick = useStoreTick();
-    const branches = S.get("branches") || [];
-    const investors = S.get("investors") || [];
-    const profiles = S.get("profiles") || [];
-    const [invites, setInvites] = useState([]);
-    const [loading, setLoading] = useState(false);
-    const [showPassword, setShowPassword] = useState(false);
-    const [deletedIds, setDeletedIds] = useState([]);
-    const [jadwalLibur, setJadwalLibur] = useState(() => S.get("jadwalLibur") || {});
-    const [form, setForm] = useState({ role: "worker", email: "", password: "", displayName: "", branchId: branches[0]?.id || "", investorId: investors[0]?.id || "", gajiHarian: "" });
-    const [confirmAsk, confirmModal] = useConfirm();
+function SettingAkun({ pushNotif }) {
+  const tick = useStoreTick();
+  const branches = S.get("branches") || [];
+  const investors = S.get("investors") || [];
+  const profiles = useMemo(
+    () => ((S.get("profiles") || []).filter(isActiveProfile)).slice().sort((a, b) => {
+      const aName = String(a.display_name || a.displayName || a.email || "").toLowerCase();
+      const bName = String(b.display_name || b.displayName || b.email || "").toLowerCase();
+      return aName.localeCompare(bName, "id");
+    }),
+    [tick]
+  );
+  const [invites, setInvites] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const [formErrors, setFormErrors] = useState({});
+  const [actionBusy, setActionBusy] = useState("");
+  const [jadwalLibur, setJadwalLibur] = useState(() => S.get("jadwalLibur") || {});
+  const [form, setForm] = useState({ role: "worker", email: "", password: "", displayName: "", branchId: branches[0]?.id || "", investorId: investors[0]?.id || "", gajiHarian: "" });
+  const [confirmAsk, confirmModal] = useConfirm();
 
-    useEffect(() => {
-      if (!form.branchId && branches[0]?.id) setForm((f) => ({ ...f, branchId: branches[0].id }));
-      if (!form.investorId && investors[0]?.id) setForm((f) => ({ ...f, investorId: investors[0].id }));
-    }, [tick]);
+  useEffect(() => {
+    setForm((prev) => ({
+      ...prev,
+      branchId: branches.some((b) => b.id === prev.branchId) ? prev.branchId : (branches[0]?.id || ""),
+      investorId: investors.some((i) => i.id === prev.investorId) ? prev.investorId : (investors[0]?.id || ""),
+    }));
+    setJadwalLibur(S.get("jadwalLibur") || {});
+  }, [tick, branches, investors]);
 
-    const refreshInvites = async () => {
-      setLoading(true);
-      try { const { data, error } = await sb.from("invites").select("*").order("created_at", { ascending: false }); if (error) throw error; setInvites(data || []); }
-      catch (e) { pushNotif(e?.message || String(e), "warning"); } finally { setLoading(false); }
+  const refreshInvites = async () => {
+    setLoading(true);
+    try {
+      const { data, error } = await sb.from("invites").select("*").order("created_at", { ascending: false });
+      if (error) throw error;
+      setInvites((data || []).slice().sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || ""))));
+    } catch (e) {
+      pushNotif(e?.message || String(e), "warning");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { refreshInvites(); }, []);
+
+  const reloadAccountData = async () => {
+    await Promise.all([
+      refreshInvites(),
+      S.loadKey("profiles").catch((e) => pushNotif(e?.message || String(e), "warning"))
+    ]);
+  };
+
+  const setRoleForm = (role) => {
+    setForm((prev) => ({
+      ...prev,
+      role,
+      branchId: role === "worker" ? (prev.branchId || branches[0]?.id || "") : "",
+      investorId: role === "investor" ? (prev.investorId || investors[0]?.id || "") : "",
+      gajiHarian: role === "worker" ? prev.gajiHarian : ""
+    }));
+    setFormErrors((prev) => ({ ...prev, role: "", branchId: "", investorId: "", gajiHarian: "" }));
+  };
+
+  const validateForm = useCallback(() => {
+    const errors = {};
+    const rawEmail = String(form.email || "").trim();
+    const rawPassword = String(form.password || "").trim();
+    const rawDisplayName = String(form.displayName || "").trim();
+    const normalizedEmail = rawEmail.includes("@") ? rawEmail.toLowerCase() : `${rawEmail.toLowerCase()}@donatboss.local`;
+
+    if (!rawEmail) errors.email = "Username / email wajib diisi.";
+    else if (/\s/.test(rawEmail)) errors.email = "Username / email tidak boleh mengandung spasi.";
+    else if (!rawEmail.includes("@") && rawEmail.length < 3) errors.email = "Username minimal 3 karakter.";
+    else if (profiles.some((p) => String(p.email || "").toLowerCase() === normalizedEmail)) errors.email = "Email / username ini sudah terdaftar.";
+
+    if (!rawPassword) errors.password = "Kata sandi wajib diisi.";
+    else if (rawPassword.length < 8) errors.password = "Minimal 8 karakter agar lebih aman.";
+
+    if (rawDisplayName.length > 80) errors.displayName = "Nama tampilan terlalu panjang.";
+
+    if (!["worker", "investor", "owner"].includes(form.role)) errors.role = "Role akun tidak valid.";
+
+    if (form.role === "worker") {
+      if (!form.branchId) errors.branchId = "Cabang wajib dipilih untuk pekerja.";
+      else if (!branches.some((b) => b.id === form.branchId)) errors.branchId = "Cabang yang dipilih tidak ditemukan.";
+      if (form.gajiHarian !== "" && form.gajiHarian !== null) {
+        const gaji = Number(form.gajiHarian);
+        if (!Number.isFinite(gaji) || gaji < 0) errors.gajiHarian = "Gaji harian harus angka 0 atau lebih.";
+      }
+    }
+
+    if (form.role === "investor") {
+      if (!form.investorId) errors.investorId = "Investor wajib dipilih.";
+      else if (!investors.some((i) => i.id === form.investorId)) errors.investorId = "Investor yang dipilih tidak ditemukan.";
+    }
+
+    return {
+      errors,
+      normalizedEmail,
+      displayName: rawDisplayName,
     };
+  }, [form, branches, investors, profiles]);
 
-    useEffect(() => { refreshInvites(); }, []);
-
-    const createInvite = async () => {
-      const emailInput = String(form.email || "").trim();
-      const pwdInput = String(form.password || "").trim();
-      if (!emailInput) { alert("Username / Email tidak boleh kosong."); return; }
-      if (!pwdInput || pwdInput.length < 6) { alert("Password wajib diisi (minimal 6 karakter)."); return; }
-      if (form.role === "worker" && !form.branchId) { alert("Pilih cabang untuk pekerja."); return; }
-      if (form.role === "investor" && !form.investorId) { alert("Pilih investor."); return; }
-      const emailFormat = emailInput.includes("@") ? emailInput : `${emailInput.toLowerCase()}@donatboss.local`;
-      try {
-        const { data: sessData } = await sb.auth.getSession();
-        const token = sessData?.session?.access_token;
-        if (!token) throw new Error("Owner harus login dulu.");
-        const resp = await fetch("/api/create-user", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
-          body: JSON.stringify({ emailOrUsername: emailFormat, password: pwdInput, role: form.role, displayName: String(form.displayName || "").trim() || null, branchId: form.role === "worker" ? form.branchId : null, investorId: form.role === "investor" ? form.investorId : null, gajiHarian: form.role === "worker" && form.gajiHarian ? parseFloat(form.gajiHarian) : null })
-        });
-        const text = await resp.text(); let json = null; try { json = JSON.parse(text); } catch {}
-        if (!resp.ok) throw new Error(json?.error || text || "Gagal membuat user.");
-        pushNotif("Akun Berhasil Dibuat!", "success");
-        setForm((f) => ({ ...f, email: "", password: "", displayName: "" }));
-        refreshInvites();
-      } catch (e) { pushNotif(e?.message || String(e), "warning"); }
-    };
-
-    const deleteInvite = async (id) => {
-      try { const { error } = await sb.from("invites").delete().eq("id", id); if (error) throw error; refreshInvites(); }
-      catch (e) { pushNotif(e?.message || String(e), "warning"); }
-    };
-    const askDeleteInvite = (iv) => confirmAsk({ title: "Hapus Antrean", message: `Hapus antrean akun "${iv.email}"?`, onConfirm: () => deleteInvite(iv.id) });
-
-    const updateLibur = (userId, hari) => {
-      const baru = { ...jadwalLibur, [userId]: hari };
-      S.set("jadwalLibur", baru); setJadwalLibur(baru);
+  const updateLibur = async (userId, hari) => {
+    const baru = { ...jadwalLibur };
+    if (hari) baru[userId] = hari;
+    else delete baru[userId];
+    try {
+      const saved = await saveJadwalLiburToDb(baru);
+      S.set("jadwalLibur", saved);
+      setJadwalLibur(saved);
       pushNotif("Jadwal libur diset ke " + (hari || "Tidak Ada"), "success");
-    };
+    } catch (e) {
+      pushNotif(e?.message || String(e), "warning");
+    }
+  };
 
-    const filteredProfiles = profiles.filter((p) => !deletedIds.includes(p.user_id));
+  const createInvite = async () => {
+    const validation = validateForm();
+    setFormErrors(validation.errors);
+    if (Object.keys(validation.errors).length > 0) {
+      pushNotif("Periksa lagi data akun yang masih belum valid.", "warning");
+      return;
+    }
 
-    return React.createElement("div", null,
-      React.createElement("h3", { className: "section-title mt8" }, "Akun & Invite"),
-      React.createElement("p", { className: "info-txt" }, "Kelola akun pekerja dan investor langsung dari aplikasi."),
-      React.createElement("div", { className: "form-card mt8" },
-        React.createElement("h4", null, "Buat Akun Baru"),
-        React.createElement("div", { className: "field-group" },
-          React.createElement("label", null, "Role"),
-          React.createElement("div", { className: "role-tabs" },
-            React.createElement("button", { className: "role-tab" + (form.role === "worker" ? " active" : ""), onClick: () => setForm((f) => ({ ...f, role: "worker" })) }, "Pekerja"),
-            React.createElement("button", { className: "role-tab" + (form.role === "investor" ? " active" : ""), onClick: () => setForm((f) => ({ ...f, role: "investor" })) }, "Investor"),
-            React.createElement("button", { className: "role-tab" + (form.role === "owner" ? " active" : ""), onClick: () => setForm((f) => ({ ...f, role: "owner" })) }, "Owner")
-          )
+    const branchLabel = form.role === "worker"
+      ? (branches.find((b) => b.id === form.branchId)?.name || form.branchId)
+      : "";
+    const investorLabel = form.role === "investor"
+      ? (investors.find((i) => i.id === form.investorId)?.nama || form.investorId)
+      : "";
+    const summary = [
+      `Role: ${form.role === "worker" ? "Pekerja" : form.role === "investor" ? "Investor" : "Owner"}`,
+      `Login: ${validation.normalizedEmail}`,
+      validation.displayName ? `Nama tampilan: ${validation.displayName}` : null,
+      branchLabel ? `Cabang: ${branchLabel}` : null,
+      investorLabel ? `Investor: ${investorLabel}` : null,
+      form.role === "worker" && form.gajiHarian !== "" ? `Gaji harian: ${fmtRp(Number(form.gajiHarian) || 0)}` : null,
+      "Akun akan langsung aktif setelah berhasil dibuat."
+    ].filter(Boolean).join("\n");
+
+    confirmAsk({
+      title: "Buat Akun Baru",
+      message: summary,
+      confirmLabel: "Ya, Buat Akun",
+      danger: false,
+      onConfirm: async () => {
+        setActionBusy("create");
+        try {
+          const { data: sessData } = await sb.auth.getSession();
+          const token = sessData?.session?.access_token;
+          if (!token) throw new Error("Owner harus login dulu.");
+          const resp = await fetch("/api/create-user", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${token}`
+            },
+            body: JSON.stringify({
+              emailOrUsername: validation.normalizedEmail,
+              password: String(form.password || "").trim(),
+              role: form.role,
+              displayName: validation.displayName || null,
+              branchId: form.role === "worker" ? form.branchId : null,
+              investorId: form.role === "investor" ? form.investorId : null,
+              gajiHarian: form.role === "worker" && form.gajiHarian !== "" ? Number(form.gajiHarian) : null
+            })
+          });
+          const text = await resp.text();
+          let json = null;
+          try { json = JSON.parse(text); } catch {}
+          if (!resp.ok) throw new Error(json?.error || text || "Gagal membuat user.");
+          pushNotif("Akun berhasil dibuat dan siap dipakai.", "success");
+          setForm({
+            role: form.role,
+            email: "",
+            password: "",
+            displayName: "",
+            branchId: branches[0]?.id || "",
+            investorId: investors[0]?.id || "",
+            gajiHarian: ""
+          });
+          setFormErrors({});
+          await reloadAccountData();
+        } catch (e) {
+          pushNotif(e?.message || String(e), "warning");
+          throw e;
+        } finally {
+          setActionBusy("");
+        }
+      }
+    });
+  };
+
+  const deleteInvite = async (id) => {
+    try {
+      const { error } = await sb.from("invites").delete().eq("id", id);
+      if (error) throw error;
+      await refreshInvites();
+    } catch (e) {
+      pushNotif(e?.message || String(e), "warning");
+    }
+  };
+
+  const askDeleteInvite = (iv) => confirmAsk({
+    title: "Hapus Antrean",
+    message: `Hapus antrean akun "${iv.email}"?`,
+    onConfirm: () => deleteInvite(iv.id)
+  });
+
+  const askArchiveAccount = (p) => confirmAsk({
+    title: "Nonaktifkan Akun",
+    message: [
+      `Akun: ${p.display_name || p.displayName || p.email || p.user_id}`,
+      `Role: ${p.role}`,
+      p.branchId ? `Cabang: ${branches.find((b) => b.id === p.branchId)?.name || p.branchId}` : null,
+      "Akun akan dinonaktifkan: akses login dicabut dan status ditandai nonaktif. Histori transaksi bisnis tetap tersimpan. Akun ini bisa diaktifkan kembali lewat database bila diperlukan."
+    ].filter(Boolean).join("\n"),
+    confirmLabel: "Ya, Nonaktifkan",
+    danger: true,
+    requireText: true,
+    textLabel: "Alasan penonaktifan",
+    textPlaceholder: "Contoh: pegawai resign, akun duplikat, investor tidak aktif",
+    textHelp: "Alasan ini dikirim ke backend agar jejak perubahan lebih rapi.",
+    onConfirm: async (reasonText) => {
+      setActionBusy(p.user_id);
+      try {
+        const { error } = await sb.rpc("hapus_akun_langsung", {
+          target_user_id: p.user_id,
+          target_email: p.email,
+          reason: String(reasonText || "").trim()
+        });
+        if (error) throw error;
+        pushNotif("Akun berhasil dinonaktifkan.", "success");
+        await reloadAccountData();
+      } catch (err) {
+        pushNotif(err?.message || String(err), "warning");
+        throw err;
+      } finally {
+        setActionBusy("");
+      }
+    }
+  });
+
+  return React.createElement("div", null,
+    React.createElement("h3", { className: "section-title mt8" }, "Akun & Invite"),
+    React.createElement("p", { className: "info-txt" }, "Kelola akun pekerja, investor, dan owner dengan validasi yang lebih aman agar tidak mudah salah input."),
+    React.createElement("div", { className: "form-card mt8" },
+      React.createElement("h4", null, "Buat Akun Baru"),
+      React.createElement("p", { className: "info-txt", style: { marginTop: 0 } }, "Gunakan username singkat tanpa spasi. Sistem akan mengubahnya otomatis menjadi email login internal jika belum memakai @."),
+      React.createElement("div", { className: "field-group" },
+        React.createElement("label", null, "Role"),
+        React.createElement("div", { className: "role-tabs" },
+          React.createElement("button", { type: "button", disabled: !!actionBusy, className: "role-tab" + (form.role === "worker" ? " active" : ""), onClick: () => setRoleForm("worker") }, "Pekerja"),
+          React.createElement("button", { type: "button", disabled: !!actionBusy, className: "role-tab" + (form.role === "investor" ? " active" : ""), onClick: () => setRoleForm("investor") }, "Investor"),
+          React.createElement("button", { type: "button", disabled: !!actionBusy, className: "role-tab" + (form.role === "owner" ? " active" : ""), onClick: () => setRoleForm("owner") }, "Owner")
         ),
-        React.createElement("div", { className: "field-group" }, React.createElement("label", null, "Username / Email"), React.createElement("input", { className: "inp", value: form.email, onChange: (e) => setForm((f) => ({ ...f, email: e.target.value })), placeholder: "Ketik nama user (misal: satria)" })),
-        React.createElement("div", { className: "field-group", style: { marginTop: 4 } },
-          React.createElement("label", null, "Kata Sandi"),
-          React.createElement("div", { style: { position: "relative", display: "flex", alignItems: "center" } },
-            React.createElement("input", { className: "inp", type: showPassword ? "text" : "password", value: form.password, onChange: (e) => setForm((f) => ({ ...f, password: e.target.value })), placeholder: "Minimal 6 karakter..." }),
-            React.createElement("button", { type: "button", style: { position: "absolute", right: 10, background: "none", border: "none", color: "var(--text2)", cursor: "pointer", fontSize: 11, fontWeight: "700" }, onClick: () => setShowPassword(!showPassword) }, showPassword ? "SEMBUNYIKAN" : "LIHAT")
-          )
+        formErrors.role && React.createElement("p", { className: "field-warning" }, formErrors.role)
+      ),
+      React.createElement("div", { className: "field-group" },
+        React.createElement("label", null, "Username / Email"),
+        React.createElement("input", {
+          className: "inp",
+          value: form.email,
+          disabled: !!actionBusy,
+          onChange: (e) => {
+            const value = e.target.value;
+            setForm((f) => ({ ...f, email: value }));
+            if (formErrors.email) setFormErrors((prev) => ({ ...prev, email: "" }));
+          },
+          placeholder: "Contoh: satria atau satria@bisnis.com"
+        }),
+        formErrors.email && React.createElement("p", { className: "field-warning" }, formErrors.email)
+      ),
+      React.createElement("div", { className: "field-group", style: { marginTop: 4 } },
+        React.createElement("label", null, "Kata Sandi"),
+        React.createElement("div", { style: { position: "relative", display: "flex", alignItems: "center" } },
+          React.createElement("input", {
+            className: "inp",
+            type: showPassword ? "text" : "password",
+            value: form.password,
+            disabled: !!actionBusy,
+            onChange: (e) => {
+              const value = e.target.value;
+              setForm((f) => ({ ...f, password: value }));
+              if (formErrors.password) setFormErrors((prev) => ({ ...prev, password: "" }));
+            },
+            placeholder: "Minimal 8 karakter..."
+          }),
+          React.createElement("button", { type: "button", disabled: !!actionBusy, style: { position: "absolute", right: 10, background: "none", border: "none", color: "var(--text2)", cursor: "pointer", fontSize: 11, fontWeight: "700" }, onClick: () => setShowPassword(!showPassword) }, showPassword ? "SEMBUNYIKAN" : "LIHAT")
         ),
-        React.createElement("div", { className: "field-group", style: { marginTop: 4 } }, React.createElement("label", null, "Nama Tampilan (opsional)"), React.createElement("input", { className: "inp", value: form.displayName, onChange: (e) => setForm((f) => ({ ...f, displayName: e.target.value })), placeholder: "Nama asli kasir..." })),
-        form.role === "worker" && React.createElement("div", { className: "field-group" }, React.createElement("label", null, "Cabang"), React.createElement("select", { className: "inp", value: form.branchId, onChange: (e) => setForm((f) => ({ ...f, branchId: e.target.value })) }, React.createElement("option", { value: "" }, "-- Pilih --"), branches.map((b) => React.createElement("option", { key: b.id, value: b.id }, b.name)))),
-        form.role === "worker" && React.createElement("div", { className: "field-group" }, React.createElement("label", null, "Gaji Harian (Rp) — opsional"), React.createElement("input", { className: "inp", type: "number", value: form.gajiHarian, onChange: (e) => setForm((f) => ({ ...f, gajiHarian: e.target.value })), placeholder: "Contoh: 50000" })),
-        form.role === "investor" && React.createElement("div", { className: "field-group" }, React.createElement("label", null, "Pilih Investor"), React.createElement("select", { className: "inp", value: form.investorId, onChange: (e) => setForm((f) => ({ ...f, investorId: e.target.value })) }, React.createElement("option", { value: "" }, "-- Pilih --"), investors.map((i) => React.createElement("option", { key: i.id, value: i.id }, i.nama, " (", i.persenBagi, "%)"))), investors.length === 0 && React.createElement("p", { className: "info-txt mt8" }, "Belum ada investor. Buat dulu di tab Investor.")),
-        React.createElement("button", { className: "btn-primary", onClick: createInvite }, "+ Buat Akun Langsung")
+        formErrors.password && React.createElement("p", { className: "field-warning" }, formErrors.password)
       ),
-      React.createElement("h3", { className: "section-title mt12" }, "Daftar Antrean Akun"),
-      loading && React.createElement("p", { className: "info-txt" }, "Memuat..."),
-      !loading && invites.length === 0 && React.createElement("p", { className: "empty-txt" }, "Belum ada antrean."),
-      !loading && invites.map((iv) =>
-        React.createElement("div", { key: iv.id, className: "investor-row" },
-          React.createElement("div", { style: { flex: 1 } },
-            React.createElement("strong", null, iv.email),
-            React.createElement("div", { style: { fontSize: 12, color: "var(--text2)" } }, "Role: ", iv.role, iv.branchId ? ` | Cabang: ${branches.find((b) => b.id === iv.branchId)?.name || iv.branchId}` : "", iv.investorId ? ` | Investor: ${investors.find((i) => i.id === iv.investorId)?.nama || iv.investorId}` : "")
-          ),
-          React.createElement(RowMenu, { actions: [{ label: "Hapus", danger: true, onClick: () => askDeleteInvite(iv) }] })
-        )
+      React.createElement("div", { className: "field-group", style: { marginTop: 4 } },
+        React.createElement("label", null, "Nama Tampilan (opsional)"),
+        React.createElement("input", {
+          className: "inp",
+          value: form.displayName,
+          disabled: !!actionBusy,
+          onChange: (e) => {
+            const value = e.target.value;
+            setForm((f) => ({ ...f, displayName: value }));
+            if (formErrors.displayName) setFormErrors((prev) => ({ ...prev, displayName: "" }));
+          },
+          placeholder: "Nama asli kasir / investor..."
+        }),
+        formErrors.displayName && React.createElement("p", { className: "field-warning" }, formErrors.displayName)
       ),
-      React.createElement("h3", { className: "section-title mt12" }, "Akun Aktif Terdaftar"),
-      filteredProfiles.length === 0 && React.createElement("p", { className: "empty-txt" }, "Belum ada data profiles."),
-      filteredProfiles.map((p) =>
-        React.createElement("div", { key: p.user_id, className: "branch-row", style: { alignItems: "flex-start" } },
-          React.createElement("div", { style: { flex: 1 } },
-            React.createElement("strong", null, p.display_name || p.displayName || p.email || p.user_id.slice(0, 8)),
-            React.createElement("div", { style: { fontSize: 12, color: "var(--text2)" } }, "Role: ", p.role, p.branchId ? ` | Cabang: ${branches.find((b) => b.id === p.branchId)?.name || p.branchId}` : "", p.gajiHarian ? ` | Gaji: ${fmtRp(p.gajiHarian)}/hari` : ""),
-            p.role === "worker" && React.createElement("div", { style: { marginTop: 6, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } },
-              React.createElement("span", { style: { fontSize: 12 } }, "Gaji/hari:"),
-              React.createElement("input", { type: "number", className: "inp inp-sm", style: { width: 100, padding: "2px 6px", fontSize: 12 }, defaultValue: p.gajiHarian || "", placeholder: "0", onBlur: async (e) => {
+      form.role === "worker" && React.createElement("div", { className: "field-group" },
+        React.createElement("label", null, "Cabang"),
+        React.createElement("select", {
+          className: "inp",
+          value: form.branchId,
+          disabled: !!actionBusy,
+          onChange: (e) => {
+            setForm((f) => ({ ...f, branchId: e.target.value }));
+            if (formErrors.branchId) setFormErrors((prev) => ({ ...prev, branchId: "" }));
+          }
+        },
+          React.createElement("option", { value: "" }, "-- Pilih --"),
+          branches.map((b) => React.createElement("option", { key: b.id, value: b.id }, b.name))
+        ),
+        formErrors.branchId && React.createElement("p", { className: "field-warning" }, formErrors.branchId)
+      ),
+      form.role === "worker" && React.createElement("div", { className: "field-group" },
+        React.createElement("label", null, "Gaji Harian (Rp) — opsional"),
+        React.createElement("input", {
+          className: "inp",
+          type: "number",
+          value: form.gajiHarian,
+          disabled: !!actionBusy,
+          onChange: (e) => {
+            setForm((f) => ({ ...f, gajiHarian: e.target.value }));
+            if (formErrors.gajiHarian) setFormErrors((prev) => ({ ...prev, gajiHarian: "" }));
+          },
+          placeholder: "Contoh: 50000"
+        }),
+        formErrors.gajiHarian && React.createElement("p", { className: "field-warning" }, formErrors.gajiHarian)
+      ),
+      form.role === "investor" && React.createElement("div", { className: "field-group" },
+        React.createElement("label", null, "Pilih Investor"),
+        React.createElement("select", {
+          className: "inp",
+          value: form.investorId,
+          disabled: !!actionBusy,
+          onChange: (e) => {
+            setForm((f) => ({ ...f, investorId: e.target.value }));
+            if (formErrors.investorId) setFormErrors((prev) => ({ ...prev, investorId: "" }));
+          }
+        },
+          React.createElement("option", { value: "" }, "-- Pilih --"),
+          investors.map((i) => React.createElement("option", { key: i.id, value: i.id }, i.nama, " (", i.persenBagi, "%)"))
+        ),
+        investors.length === 0 && React.createElement("p", { className: "info-txt mt8" }, "Belum ada investor. Buat dulu di tab Investor."),
+        formErrors.investorId && React.createElement("p", { className: "field-warning" }, formErrors.investorId)
+      ),
+      React.createElement("button", { className: "btn-primary", onClick: createInvite, disabled: actionBusy === "create" }, actionBusy === "create" ? "Membuat Akun..." : "+ Buat Akun Langsung")
+    ),
+    React.createElement("h3", { className: "section-title mt12" }, "Daftar Antrean Akun"),
+    loading && React.createElement("p", { className: "info-txt" }, "Memuat..."),
+    !loading && invites.length === 0 && React.createElement("p", { className: "empty-txt" }, "Belum ada antrean."),
+    !loading && invites.map((iv) =>
+      React.createElement("div", { key: iv.id, className: "investor-row" },
+        React.createElement("div", { style: { flex: 1 } },
+          React.createElement("strong", null, iv.displayName || iv.email),
+          React.createElement("div", { style: { fontSize: 12, color: "var(--text2)" } }, "Login: ", iv.email),
+          React.createElement("div", { style: { fontSize: 12, color: "var(--text2)" } }, "Role: ", iv.role, iv.branchId ? ` | Cabang: ${branches.find((b) => b.id === iv.branchId)?.name || iv.branchId}` : "", iv.investorId ? ` | Investor: ${investors.find((i) => i.id === iv.investorId)?.nama || iv.investorId}` : "")
+        ),
+        React.createElement(RowMenu, { actions: [{ label: "Hapus", danger: true, onClick: () => askDeleteInvite(iv) }] })
+      )
+    ),
+    React.createElement("h3", { className: "section-title mt12" }, "Akun Aktif Terdaftar"),
+    profiles.length === 0 && React.createElement("p", { className: "empty-txt" }, "Belum ada data profiles."),
+    profiles.map((p) =>
+      React.createElement("div", { key: p.user_id, className: "branch-row", style: { alignItems: "flex-start" } },
+        React.createElement("div", { style: { flex: 1 } },
+          React.createElement("strong", null, p.display_name || p.displayName || p.email || p.user_id.slice(0, 8)),
+          React.createElement("div", { style: { fontSize: 12, color: "var(--text2)" } }, "Login: ", p.email || "-"),
+          React.createElement("div", { style: { fontSize: 12, color: "var(--text2)" } }, "Role: ", p.role, p.branchId ? ` | Cabang: ${branches.find((b) => b.id === p.branchId)?.name || p.branchId}` : "", p.investorId ? ` | Investor: ${investors.find((i) => i.id === p.investorId)?.nama || p.investorId}` : "", p.gajiHarian ? ` | Gaji: ${fmtRp(p.gajiHarian)}/hari` : ""),
+          p.role === "worker" && React.createElement("div", { style: { marginTop: 6, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } },
+            React.createElement("span", { style: { fontSize: 12 } }, "Gaji/hari:"),
+            React.createElement("input", {
+              type: "number",
+              className: "inp inp-sm",
+              style: { width: 120, padding: "2px 6px", fontSize: 12 },
+              defaultValue: p.gajiHarian || "",
+              placeholder: "0",
+              disabled: !!actionBusy,
+              onBlur: async (e) => {
                 const val = parseFloat(e.target.value) || 0;
                 const { error } = await sb.from("profiles").update({ gajiHarian: val }).eq("user_id", p.user_id);
                 if (error) pushNotif(error.message, "warning");
-                else { await S.loadKey("profiles"); pushNotif("Gaji diperbarui!", "success"); }
-              } }),
-              React.createElement("span", { style: { fontSize: 12, marginLeft: 8 } }, "Libur:"),
-              React.createElement("select", { className: "inp inp-sm", style: { width: "auto", display: "inline-block", padding: "2px 6px", fontSize: 12 }, value: jadwalLibur[p.user_id] || "", onChange: (e) => updateLibur(p.user_id, e.target.value) },
-                React.createElement("option", { value: "" }, "-- Tidak Libur --"),
-                ["Minggu","Senin","Selasa","Rabu","Kamis","Jumat","Sabtu"].map((h) => React.createElement("option", { key: h, value: h }, h))
-              )
+                else {
+                  await S.loadKey("profiles");
+                  pushNotif("Gaji diperbarui!", "success");
+                }
+              }
+            }),
+            React.createElement("span", { style: { fontSize: 12, marginLeft: 8 } }, "Libur:"),
+            React.createElement("select", {
+              className: "inp inp-sm",
+              style: { width: "auto", display: "inline-block", padding: "2px 6px", fontSize: 12 },
+              value: jadwalLibur[p.user_id] || "",
+              disabled: !!actionBusy,
+              onChange: (e) => updateLibur(p.user_id, e.target.value)
+            },
+              React.createElement("option", { value: "" }, "-- Tidak Libur --"),
+              ["Minggu","Senin","Selasa","Rabu","Kamis","Jumat","Sabtu"].map((h) => React.createElement("option", { key: h, value: h }, h))
             )
-          ),
-          p.role !== "owner" && React.createElement(RowMenu, { actions: [{ label: "Hapus Akun", danger: true, onClick: () => confirmAsk({
-            title: "Hapus Akun",
-            message: `Hapus total akun ${p.email || p.display_name || p.displayName}? Tindakan ini tidak dapat dibatalkan.`,
-            onConfirm: async () => {
-              try {
-                const { error } = await sb.rpc("hapus_akun_langsung", { target_user_id: p.user_id, target_email: p.email });
-                if (error) throw error;
-                setDeletedIds((prev) => [...prev, p.user_id]);
-                pushNotif("Akun berhasil dihapus!", "success");
-              } catch (err) { pushNotif(err?.message || String(err), "warning"); }
-            }
-          }) }] })
-        )
-      ),
-      confirmModal
-    );
-  }
+          )
+        ),
+        p.role !== "owner" && React.createElement(RowMenu, {
+          actions: [{
+            label: actionBusy === p.user_id ? "Memproses..." : "Nonaktifkan Akun",
+            danger: true,
+            onClick: () => !actionBusy && askArchiveAccount(p)
+          }]
+        })
+      )
+    ),
+    confirmModal
+  );
+}
 
   // ─── SettingInvestor ───────────────────────────────────────────────────────
   function SettingInvestor({ pushNotif }) {
@@ -3497,11 +3873,17 @@ var DonatBoss = (() => {
       setBusy(true);
       try {
         for (const t of tables) {
+          if (selDate && t === "stokLapak") throw new Error("Stok Lapak tidak punya kolom tanggal yang aman untuk filter hapus. Kosongkan tanggal jika memang ingin hapus stok lapak.");
           let query = sb.from(t).delete().neq("id", "00000000-0000-0000-0000-000000000000");
-          if (selBranch && t !== "pengeluaranOwner") query = query.eq("branchId", selBranch);
+          if (selBranch && t !== "pengeluaranOwner" && t !== "produksiCK") query = query.eq("branchId", selBranch);
           if (selDate) {
-            if (["transactions", "pengeluaranLapak", "pengeluaranOwner", "setoranHarian", "absensi"].includes(t)) query = query.eq("date", selDate);
+            if (["transactions", "pengeluaranLapak", "pengeluaranOwner", "setoranHarian", "absensi", "produksiCK", "distribusiCK", "stokTidakTerjual"].includes(t)) query = query.eq("date", selDate);
             else if (["setoranBulanan", "absensiBulanan", "gajiPembayaran"].includes(t)) query = query.eq("bulan", selDate.slice(0, 7));
+            else if (t === "editLog") {
+              const parts = selDate.split("-");
+              const tsDate = parts.length === 3 ? `${parts[2]}/${parts[1]}/${parts[0]}` : selDate;
+              query = query.like("ts", `${tsDate},%`);
+            }
           }
           const { error } = await query; if (error) throw error;
         }
@@ -3528,6 +3910,7 @@ var DonatBoss = (() => {
       { label: "Absensi", icon: "\uD83D\uDD52", fn: () => doClear("Absensi", ["absensi", "absensiBulanan", "gajiPembayaran"], ["absensi", "absensiBulanan", "gajiPembayaran"]) },
       { label: "Edit Log", icon: "\uD83D\uDCDD", fn: () => doClear("Edit Log", ["editLog"], ["editLog"]) },
       { label: "Stok Lapak", icon: "\uD83D\uDCE6", fn: () => doClear("Stok Lapak", ["stokLapak"], ["stokLapak"]) },
+      { label: "Donat Tidak Terjual", icon: "\uD83D\uDCC9", fn: () => doClear("Donat Tidak Terjual", ["stokTidakTerjual"], ["stokTidakTerjual"]) },
       { label: "Produksi & Distribusi CK", icon: "\uD83C\uDF69", fn: () => doClear("Produksi & Distribusi CK", ["produksiCK", "distribusiCK"], ["produksiCK", "distribusiCK"]) },
     ];
 
@@ -4462,8 +4845,19 @@ var DonatBoss = (() => {
     const [ownerTab, setOwnerTab] = useState("dashboard");
     const [navOpen, setNavOpen] = useState(false);
     const [theme, setTheme] = useState(() => {
-      try { return localStorage.getItem("evora_theme") || "dark"; } catch { return "dark"; }
-    });
+  try { return localStorage.getItem("evora_theme") || "dark"; } catch { return "dark"; }
+});
+
+if (!sb) {
+  return React.createElement("div", { className: "login-wrap" },
+    React.createElement("div", { className: "login-card" },
+      React.createElement("div", { style: { fontSize: 44, textAlign: "center" } }, "⚠️"),
+      React.createElement("h1", { className: "login-title" }, "Konfigurasi Belum Siap"),
+      React.createElement("p", { className: "login-sub", style: { whiteSpace: "pre-line" } }, APP_BOOT_ERROR || "Client Supabase belum berhasil diinisialisasi."),
+      React.createElement("p", { className: "login-hint" }, "Periksa file config.js, library Supabase, dan urutan load script sebelum app.bundle.js.")
+    )
+  );
+}
 
     useEffect(() => {
       try { document.documentElement.setAttribute("data-theme", theme); localStorage.setItem("evora_theme", theme); } catch {}
@@ -4493,7 +4887,7 @@ var DonatBoss = (() => {
       try {
         const { data: prof, error } = await sb.from("profiles").select("*").eq("user_id", session.user.id).single();
         if (error) throw error;
-        if (!prof || prof.role === "none") {
+        if (!isActiveProfile(prof)) {
           pushNotif("Akun kamu belum diundang oleh Owner (akses ditolak).", "warning");
           await sb.auth.signOut(); return;
         }
@@ -4501,6 +4895,8 @@ var DonatBoss = (() => {
         await syncBrandingFromDb().catch(() => {});
         const histCfg = await syncHistoryModeFromDb().catch(() => getHistoryModeLocal());
         setHistoryMode(normalizeHistoryMode(histCfg));
+        const jadwalCfg = await syncJadwalLiburFromDb().catch(() => getJadwalLiburLocal());
+        S.set("jadwalLibur", jadwalCfg);
         await S.loadAll();
         if (prof.role === "owner") await S.loadKey("profiles").catch(() => {});
         S.startRealtime();
@@ -4522,12 +4918,14 @@ var DonatBoss = (() => {
     useEffect(() => {
       if (!authSession) return;
       let dead = false;
-      const pullHistoryMode = async () => {
+      const pullSettings = async () => {
         const cfg = await syncHistoryModeFromDb().catch(() => getHistoryModeLocal());
         if (!dead) setHistoryMode(normalizeHistoryMode(cfg));
+        const jadwalCfg = await syncJadwalLiburFromDb().catch(() => getJadwalLiburLocal());
+        if (!dead) S.set("jadwalLibur", jadwalCfg);
       };
-      pullHistoryMode();
-      const iv = setInterval(pullHistoryMode, 10000);
+      pullSettings();
+      const iv = setInterval(pullSettings, 10000);
       return () => { dead = true; clearInterval(iv); };
     }, [authSession]);
 
