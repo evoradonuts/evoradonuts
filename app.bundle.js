@@ -939,6 +939,26 @@ function useConfirm() {
     });
 
     const removeCart = (id) => setCart((c) => c.filter((x) => x.id !== id));
+
+    // ─── Tambah/kurangi qty item yang sudah ada di keranjang, tanpa perlu hapus & input ulang ───
+    const incCart = (id) => {
+      setCart((c) => {
+        const item = c.find((x) => x.id === id);
+        if (!item) return c;
+        if (item.menuId) {
+          const menu = menus.find((m) => m.id === item.menuId);
+          if (menu) {
+            const sisa = getSisaStokSetelahCart(menu);
+            if (sisa !== null && sisa <= 0) { pushNotif("Stok " + menu.nama + " sudah mencapai batas.", "warning"); return c; }
+          }
+        }
+        return c.map((x) => x.id === id ? { ...x, qty: x.qty + 1 } : x);
+      });
+    };
+    const decCart = (id) => {
+      setCart((c) => c.map((x) => x.id === id ? { ...x, qty: x.qty - 1 } : x).filter((x) => x.qty > 0));
+    };
+
     const totalBayar = cart.reduce((a, x) => a + x.hargaJual * x.qty, 0);
 
     const submitTx = async (onSuccess) => {
@@ -1277,10 +1297,14 @@ function useConfirm() {
                 cart.map((item) =>
                   React.createElement("div", { key: item.id, className: "cart-item" },
                     React.createElement("div", { className: "cart-item-info" },
-                      React.createElement("span", null, item.nama),
-                      React.createElement("span", { className: "cart-qty" }, "x", item.qty)
+                      React.createElement("span", null, item.nama)
                     ),
-                    React.createElement("div", { className: "cart-item-right" },
+                    React.createElement("div", { className: "cart-item-right", style: { display: "flex", alignItems: "center", gap: 10 } },
+                      React.createElement("div", { className: "cart-qty-stepper", style: { display: "flex", alignItems: "center", gap: 6 } },
+                        React.createElement("button", { type: "button", className: "btn-icon-sm", style: { width: 26, height: 26, lineHeight: "26px", padding: 0 }, onClick: () => decCart(item.id), "aria-label": "Kurangi qty" }, "\u2212"),
+                        React.createElement("span", { className: "cart-qty", style: { minWidth: 18, textAlign: "center", display: "inline-block" } }, item.qty),
+                        React.createElement("button", { type: "button", className: "btn-icon-sm", style: { width: 26, height: 26, lineHeight: "26px", padding: 0 }, onClick: () => incCart(item.id), "aria-label": "Tambah qty" }, "+")
+                      ),
                       React.createElement("span", null, fmtRp(item.hargaJual * item.qty)),
                       React.createElement("button", { className: "cart-item-remove", onClick: () => removeCart(item.id), "aria-label": "Hapus item" }, "\u2715")
                     )
