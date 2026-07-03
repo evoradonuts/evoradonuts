@@ -1022,7 +1022,7 @@ function useConfirm() {
     const doSetoran = () => {
       const s = S.get("setoranHarian") || [];
       const existing = s.find((x) => x.branchId === branchId && x.date === safeTxDate);
-      const entry = { id: existing?.id || uid(), branchId, branchName: curBranch?.name || branchId, date: safeTxDate, ts: tsForDate(safeTxDate), status: "menunggu", omzet: branchOmzet, pengeluaran: branchPeng };
+      const entry = { id: existing?.id || uid(), branchId, branchName: curBranch?.name || branchId, date: safeTxDate, ts: tsForDate(safeTxDate), status: "menunggu", omzet: branchOmzet, pengeluaran: branchPeng, locked: existing?.locked || false };
       S.set("setoranHarian", existing ? s.map((x) => x.id === entry.id ? entry : x) : [...s, entry]);
       setSetoran(entry);
       pushNotif("Setoran dikirim ke Owner!", "success");
@@ -2161,8 +2161,20 @@ function useConfirm() {
     const refresh = () => { setSH(S.get("setoranHarian") || []); setSB(S.get("setoranBulanan") || []); };
 
     const konfirmasi = (id) => {
-      S.set("setoranHarian", (S.get("setoranHarian") || []).map((s) => s.id === id ? { ...s, status: "selesai", konfirmasiTs: nowTs() } : s));
-      refresh(); pushNotif("Setoran dikonfirmasi!", "success");
+      S.set("setoranHarian", (S.get("setoranHarian") || []).map((s) => s.id === id ? { ...s, status: "selesai", konfirmasiTs: nowTs(), locked: true } : s));
+      refresh(); pushNotif("Setoran dikonfirmasi & dikunci!", "success");
+    };
+
+    // Buka kunci setoran harian yang sudah dikonfirmasi, supaya bisa dikoreksi.
+    // Tidak mengubah status "selesai" - cuma buka gembok proteksi hapus massal.
+    const bukaKunciSetoran = (id) => {
+      S.set("setoranHarian", (S.get("setoranHarian") || []).map((s) => s.id === id ? { ...s, locked: false } : s));
+      refresh(); pushNotif("Kunci setoran dibuka. Data ini sekarang bisa ikut terhapus oleh Bersihkan Data.", "warning");
+    };
+
+    const kunciUlangSetoran = (id) => {
+      S.set("setoranHarian", (S.get("setoranHarian") || []).map((s) => s.id === id ? { ...s, locked: true } : s));
+      refresh(); pushNotif("Setoran dikunci kembali.", "success");
     };
 
     const kirimBulanan = (branchId, investorId) => {
@@ -2183,6 +2195,13 @@ function useConfirm() {
       const bagian = laba * ((inv?.persenBagi || 0) / 100);
       const all = S.get("setoranBulanan") || [];
       const ex = all.find((s) => s.branchId === branchId && s.bulan === bulan && s.investorId === investorId);
+      // Jaring pengaman: kalau ternyata sudah ada laporan yang berstatus "selesai" (dikonfirmasi
+      // investor), jangan overwrite diam-diam walau tombolnya sempat ke-klik lewat state basi.
+      if (ex && ex.status === "selesai") {
+        pushNotif("Laporan bulan ini sudah dikonfirmasi investor dan terkunci. Tidak bisa dikirim ulang.", "warning");
+        refresh();
+        return;
+      }
       const entry = { id: ex?.id || uid(), branchId, investorId, bulan, omzet, modal, pLapak, pOwner, laba, bagianInvestor: bagian, persen: inv?.persenBagi || 0, status: "menunggu", ts: nowTs() };
       S.set("setoranBulanan", ex ? all.map((s) => s.id === entry.id ? entry : s) : [...all, entry]);
       refresh(); pushNotif("Laporan bulanan dikirim!", "success");
@@ -2192,6 +2211,7 @@ function useConfirm() {
       S.set("setoranBulanan", (S.get("setoranBulanan") || []).map((s) => s.id === id ? { ...s, status: "selesai", konfirmasiTs: nowTs(), confirmedBy: "owner" } : s));
       refresh(); pushNotif("Laporan bulanan dikonfirmasi!", "success");
     };
+
 
     return React.createElement("div", null,
       React.createElement("div", { className: "tabs" },
@@ -2214,7 +2234,12 @@ function useConfirm() {
                 React.createElement("span", { className: "badge-warn" }, "Menunggu"),
                 React.createElement("button", { className: "btn-primary btn-sm", onClick: () => konfirmasi(s.id) }, "Konfirmasi")
               ),
-              s.status === "selesai" && React.createElement("span", { className: "badge-ok" }, "Dikonfirmasi - ", s.konfirmasiTs)
+              s.status === "selesai" && React.createElement(React.Fragment, null,
+                React.createElement("span", { className: "badge-ok" }, s.locked ? "🔒 " : "🔓 ", "Dikonfirmasi - ", s.konfirmasiTs),
+                s.locked
+                  ? React.createElement("button", { className: "btn-secondary btn-sm", onClick: () => bukaKunciSetoran(s.id) }, "Buka Kunci")
+                  : React.createElement("button", { className: "btn-secondary btn-sm", onClick: () => kunciUlangSetoran(s.id) }, "Kunci Lagi")
+              )
             )
           );
         })
@@ -3867,37 +3892,85 @@ function SettingAkun({ pushNotif }) {
     const branches = S.get("branches") || [];
     const [selBranch, setSelBranch] = useState("");
     const [selDate, setSelDate] = useState("");
+    const [includeLocked, setIncludeLocked] = useState(false);
     const [confirmAsk, confirmModal] = useConfirm();
+
+    // Tabel yang punya konsep "terkunci / sudah dikonfirmasi" — dilindungi dari
+    // hapus massal secara default. Owner harus centang eksplisit "sertakan data
+    // terkunci" untuk ikut menghapusnya.
+    const applyProtection = (query, table) => {
+      if (includeLocked) return query; // override eksplisit — tidak ada proteksi
+      switch (table) {
+        case "setoranHarian":
+        case "absensiBulanan":
+          return query.neq("locked", true);
+        case "setoranBulanan":
+          return query.neq("status", "selesai");
+        case "gajiPembayaran":
+          return query.neq("status", "dikonfirmasi");
+        default:
+          return query;
+      }
+    };
+
+    // Filter cabang/tanggal yang sama dipakai baik untuk query delete maupun
+    // (jika perlu) query unlock di bawah — diekstrak supaya keduanya tidak
+    // pernah beda logic secara diam-diam.
+    const applyScopeFilters = (query, t) => {
+      let q = query;
+      if (selBranch && t !== "pengeluaranOwner" && t !== "produksiCK") q = q.eq("branchId", selBranch);
+      if (selDate) {
+        if (["transactions", "pengeluaranLapak", "pengeluaranOwner", "setoranHarian", "absensi", "produksiCK", "distribusiCK", "stokTidakTerjual"].includes(t)) q = q.eq("date", selDate);
+        else if (["setoranBulanan", "absensiBulanan", "gajiPembayaran"].includes(t)) q = q.eq("bulan", selDate.slice(0, 7));
+        else if (t === "editLog") {
+          const parts = selDate.split("-");
+          const tsDate = parts.length === 3 ? `${parts[2]}/${parts[1]}/${parts[0]}` : selDate;
+          q = q.like("ts", `${tsDate},%`);
+        }
+      }
+      return q;
+    };
+
+    // Tabel yang proteksinya sekarang juga ditegakkan di database lewat RLS
+    // (policy RESTRICTIVE berbasis kolom `locked`). Kalau override "sertakan
+    // data terkunci" dicentang, baris locked=true harus dibuka kuncinya dulu
+    // di sini, atau DELETE di bawah akan ditolak oleh Supabase — bukan lagi
+    // cuma dilewati oleh logic JS seperti sebelumnya.
+    const RLS_LOCKED_TABLES = ["setoranHarian", "absensiBulanan"];
 
     const runClear = async (label, tables, keysToReload) => {
       setBusy(true);
       try {
         for (const t of tables) {
           if (selDate && t === "stokLapak") throw new Error("Stok Lapak tidak punya kolom tanggal yang aman untuk filter hapus. Kosongkan tanggal jika memang ingin hapus stok lapak.");
-          let query = sb.from(t).delete().neq("id", "00000000-0000-0000-0000-000000000000");
-          if (selBranch && t !== "pengeluaranOwner" && t !== "produksiCK") query = query.eq("branchId", selBranch);
-          if (selDate) {
-            if (["transactions", "pengeluaranLapak", "pengeluaranOwner", "setoranHarian", "absensi", "produksiCK", "distribusiCK", "stokTidakTerjual"].includes(t)) query = query.eq("date", selDate);
-            else if (["setoranBulanan", "absensiBulanan", "gajiPembayaran"].includes(t)) query = query.eq("bulan", selDate.slice(0, 7));
-            else if (t === "editLog") {
-              const parts = selDate.split("-");
-              const tsDate = parts.length === 3 ? `${parts[2]}/${parts[1]}/${parts[0]}` : selDate;
-              query = query.like("ts", `${tsDate},%`);
-            }
+
+          if (includeLocked && RLS_LOCKED_TABLES.includes(t)) {
+            const unlockQuery = applyScopeFilters(sb.from(t).update({ locked: false }).eq("locked", true), t);
+            const { error: unlockErr } = await unlockQuery;
+            if (unlockErr) throw unlockErr;
           }
+
+          let query = applyScopeFilters(sb.from(t).delete().neq("id", "00000000-0000-0000-0000-000000000000"), t);
+          query = applyProtection(query, t);
           const { error } = await query; if (error) throw error;
         }
         for (const k of keysToReload) await S.loadKey(k).catch(() => {});
-        pushNotif(`Berhasil hapus: ${label}`, "success");
+        pushNotif(`Berhasil hapus: ${label}${includeLocked ? " (termasuk yang terkunci/dikonfirmasi)" : ""}`, "success");
       } catch (e) { pushNotif(e?.message || String(e), "warning"); } finally { setBusy(false); }
     };
 
     const doClear = (label, tables, keysToReload) => {
       const branchName = selBranch ? branches.find((b) => b.id === selBranch)?.name : "SEMUA CABANG";
       const dateName = selDate ? formatTanggalIndo(selDate) : "SEMUA TANGGAL";
+      const hasProtectedTable = tables.some((t) => ["setoranHarian", "absensiBulanan", "setoranBulanan", "gajiPembayaran"].includes(t));
       confirmAsk({
         title: "Hapus Data: " + label,
-        message: `Cabang: ${branchName} | Tanggal: ${dateName}. Tindakan ini tidak bisa dibatalkan.`,
+        message: `Cabang: ${branchName} | Tanggal: ${dateName}. Tindakan ini tidak bisa dibatalkan.` +
+          (hasProtectedTable
+            ? (includeLocked
+                ? " ⚠️ Kamu MENCENTANG \"sertakan data terkunci\" — data yang sudah dikonfirmasi/dikunci JUGA akan ikut terhapus."
+                : " Data yang sudah dikonfirmasi/dikunci akan DILEWATI otomatis (aman).")
+            : ""),
         confirmLabel: "Ya, Hapus " + label,
         onConfirm: () => runClear(label, tables, keysToReload)
       });
@@ -3931,6 +4004,12 @@ function SettingAkun({ pushNotif }) {
         ),
         React.createElement("p", { className: "info-txt", style: { fontSize: 11 } }, "Catatan: untuk \"Produksi & Distribusi CK\", filter Cabang tidak berlaku untuk Produksi (selalu hapus semua produksi sesuai tanggal). Untuk Distribusi, filter Cabang berlaku normal."),
         React.createElement("p", { className: "info-txt", style: { fontSize: 11 } }, "Catatan: hapus \"Absensi\" juga akan ikut menghapus informasi gaji yang sudah dibayarkan (gajiPembayaran) pada bulan/cabang yang sama."),
+        React.createElement("label", { className: "row-wrap", style: { alignItems: "center", gap: 6, fontSize: 12, marginTop: 8, color: includeLocked ? "var(--red)" : "var(--text2)" } },
+          React.createElement("input", { type: "checkbox", checked: includeLocked, onChange: (e) => setIncludeLocked(e.target.checked) }),
+          includeLocked
+            ? "⚠️ Sertakan juga data yang sudah TERKUNCI / DIKONFIRMASI (Setoran, Absensi, Gaji, Laporan Investor)"
+            : "Secara default, Setoran/Absensi/Gaji/Laporan yang sudah dikonfirmasi & dikunci TIDAK ikut terhapus"
+        ),
         React.createElement("div", { className: "danger-zone-list mt8" },
           DANGER_ACTIONS.map((a) => React.createElement("div", { key: a.label, className: "danger-zone-row" },
             React.createElement("span", { className: "danger-zone-icon" }, a.icon),
