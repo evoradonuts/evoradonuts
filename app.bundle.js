@@ -1808,7 +1808,7 @@ function useConfirm() {
     const pO = S.get("pengeluaranOwner") || [];
     const fTxs = txs.filter((t) => t.date >= dr.from && t.date <= dr.to && (selBranch === "all" || t.branchId === selBranch));
     const fPL = pL.filter((p) => p.date >= dr.from && p.date <= dr.to && (selBranch === "all" || p.branchId === selBranch));
-    const fPO = pO.filter((p) => p.date >= dr.from && p.date <= dr.to);
+    const fPO = pO.filter((p) => p.date >= dr.from && p.date <= dr.to && (selBranch === "all" || !p.branchId || p.branchId === selBranch));
     const distribAll = S.get("distribusiCK") || [];
     const fDistrib = distribAll.filter((d) => d.date >= dr.from && d.date <= dr.to && (selBranch === "all" || d.branchId === selBranch));
     const omzet = fTxs.reduce((a, t) => a + t.total, 0);
@@ -1858,50 +1858,65 @@ function useConfirm() {
     const branchChart = branchStats.map((b) => ({ label: b.name.slice(0, 8), v1: b.omzet, v2: b.laba }));
 
     // ─── Breakdown per-KPI untuk modal detail (klik card) ────────────────────
+    // REVISI: rincian sekarang per-item/per-transaksi (bukan cuma total per cabang)
+    const bName = (id) => (id ? (branches.find((b) => b.id === id)?.name || id) : "Pusat/Global");
+    const byTsDesc = (a, b) => (b.ts || b.date || "").localeCompare(a.ts || a.date || "");
+    const KATEGORI_LABEL = { gaji_pekerja: "Gaji Pekerja Lapak", gaji_kitchen: "Gaji Central Kitchen", bahan_baku: "Bahan Baku", operasional: "Operasional", sewa: "Sewa Tempat", lainnya: "Lainnya" };
+
     const kpiBreakdowns = {
       omzet: {
         title: "Rincian Omzet", total: omzet, totalLabel: "Total Omzet",
-        rows: branchStats.map((b) => ({ label: b.name, value: b.omzet, sub: b.txCount + "x transaksi" }))
+        note: fTxs.length + " transaksi pada periode & cabang terpilih.",
+        rows: fTxs.slice().sort(byTsDesc).map((t) => ({
+          label: bName(t.branchId) + " — " + (t.items || []).map((it) => it.nama + " x" + it.qty).join(", "),
+          sub: formatTanggalIndoPendek(t.date) + (t.ts ? " " + t.ts.slice(11, 16) : ""),
+          value: t.total
+        }))
       },
       modal: {
         title: "Rincian HPP Bahan", total: modal, totalLabel: "Total HPP Bahan (terdistribusi)",
-        rows: branchStats.map((b) => ({ label: b.name, value: b.modal, sub: "Terjual: " + fmtRp(b.hppTerjual) }))
+        note: "HPP dihitung dari tiap distribusi CK yang dikirim ke cabang pada periode ini.",
+        rows: fDistrib.slice().sort(byTsDesc).map((d) => ({
+          label: (d.branchName || bName(d.branchId)) + " — " + d.menuNama,
+          sub: formatTanggalIndoPendek(d.date) + " • kirim " + d.jumlahKirim + " pcs" + (d.status === "pending" ? " • Pending" : ""),
+          value: d.hppTotal || 0
+        }))
       },
       donatTidakTerjual: {
         title: "Rincian Donat Tidak Terjual", total: donatTidakTerjual, totalLabel: "Total Donat Tidak Terjual", isCount: true,
         note: "Sisa stok yang tidak terjual saat kasir check-out, dicatat lalu di-reset (tidak dibawa ke hari berikutnya).",
-        rows: (() => {
-          const byMenu = {};
-          for (const s of fStokTidakTerjual) {
-            byMenu[s.menuNama] = (byMenu[s.menuNama] || 0) + (s.qtyTidakTerjual || 0);
-          }
-          return Object.entries(byMenu).map(([nama, qty]) => ({ label: nama, value: qty, isCount: true }));
-        })()
+        rows: fStokTidakTerjual.slice().sort(byTsDesc).map((s) => ({
+          label: bName(s.branchId) + " — " + s.menuNama,
+          sub: formatTanggalIndoPendek(s.date),
+          value: s.qtyTidakTerjual || 0, isCount: true
+        }))
       },
       peng: {
         title: "Rincian Pengeluaran", total: peng, totalLabel: "Total Pengeluaran",
+        note: "Setiap entri pengeluaran lapak & owner pada periode ini (owner sudah difilter sesuai cabang terpilih).",
         rows: [
-          { label: "Pengeluaran Lapak (semua cabang)", value: fPL.reduce((a, p) => a + p.jumlah, 0) },
-          { label: "Pengeluaran Owner", value: fPO.reduce((a, p) => a + p.jumlah, 0) }
-        ]
+          ...fPL.map((p) => ({ label: "[Lapak] " + p.keterangan, sub: formatTanggalIndoPendek(p.date) + " • " + (p.branchName || bName(p.branchId)), value: p.jumlah, ts: p.ts, date: p.date })),
+          ...fPO.map((p) => ({ label: "[Owner] " + p.keterangan, sub: formatTanggalIndoPendek(p.date) + " • " + (p.branchName || bName(p.branchId)) + (p.kategori ? " • " + (KATEGORI_LABEL[p.kategori] || p.kategori) : ""), value: p.jumlah, ts: p.ts, date: p.date }))
+        ].sort(byTsDesc)
       },
       laba: {
         title: "Rincian Laba Bersih", total: laba, totalLabel: "Laba Bersih",
-        note: "Laba Bersih = Omzet − HPP Bahan − Pengeluaran",
-        rows: [
-          { label: "Omzet", value: omzet },
-          { label: "HPP Bahan", value: -modal },
-          { label: "Pengeluaran", value: -peng }
-        ]
+        note: "Laba Bersih = Omzet − HPP Bahan − Pengeluaran, per cabang untuk periode ini.",
+        rows: branchStats.map((b) => ({ label: b.name, sub: "Omzet " + fmtRp(b.omzet) + " − HPP " + fmtRp(b.modal) + " − Peng " + fmtRp(b.peng), value: b.laba }))
       },
       tx: {
         title: "Rincian Transaksi", total: fTxs.length, totalLabel: "Total Transaksi", isCount: true,
-        rows: branchStats.map((b) => ({ label: b.name, value: b.txCount, isCount: true }))
+        rows: fTxs.slice().sort(byTsDesc).map((t) => ({
+          label: bName(t.branchId) + " — " + (t.items || []).map((it) => it.nama + " x" + it.qty).join(", "),
+          sub: formatTanggalIndoPendek(t.date) + (t.ts ? " " + t.ts.slice(11, 16) : "") + (t.edited ? " • Diedit" : ""),
+          value: fmtRp(t.total), isText: true
+        }))
       },
       dana: {
         title: "Riwayat Dana Cadangan", total: saldoDanaPemeliharaan, totalLabel: "Saldo Saat Ini",
-        rows: danaPemList.slice().sort((a, b) => (b.ts || "").localeCompare(a.ts || "")).slice(0, 8).map((d) => ({
-          label: d.keterangan + " (" + formatTanggalIndoPendek(d.date) + ")", value: d.tipe === "setor" ? d.jumlah : -d.jumlah
+        rows: danaPemList.slice().sort(byTsDesc).map((d) => ({
+          label: d.keterangan, sub: formatTanggalIndoPendek(d.date) + " • " + (d.tipe === "setor" ? "Setor" : "Tarik"),
+          value: d.tipe === "setor" ? d.jumlah : -d.jumlah
         }))
       },
       cabang: {
