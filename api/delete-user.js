@@ -1,17 +1,13 @@
 // Vercel Serverless Function
 // Simpan sebagai: /api/delete-user.js
 //
-// Fungsi: Owner bisa menonaktifkan (SOFT-DELETE) akun WORKER / INVESTOR (bukan owner).
-// Akun TIDAK dihapus dari Supabase Auth — hanya di-ban dari login, dan ditandai
-// status="deleted" di tabel profiles. Histori transaksi bisnis tetap utuh.
-// Aman: validasi token owner + cek role owner di tabel profiles + cek role target bukan owner.
-//
-// PRASYARAT: tabel `profiles` harus punya kolom: status (text), deleted_at (timestamptz),
-// deleted_by (uuid), deleted_reason (text). Kalau belum ada, jalankan dulu:
-//   ALTER TABLE profiles ADD COLUMN IF NOT EXISTS status text DEFAULT 'active';
-//   ALTER TABLE profiles ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
-//   ALTER TABLE profiles ADD COLUMN IF NOT EXISTS deleted_by uuid;
-//   ALTER TABLE profiles ADD COLUMN IF NOT EXISTS deleted_reason text;
+// PENTING: Ini SOFT-DEACTIVATE, bukan hard delete.
+// - Akses login user di-ban (bukan dihapus) via ban_duration di Supabase Auth.
+// - Baris profil TETAP ADA, cuma role diubah jadi "none" (dianggap nonaktif
+//   oleh isActiveProfile() dan semua filter role==='worker' di frontend).
+// - Email & data profil TIDAK diubah/diacak, supaya kalau owner mau
+//   mengaktifkan lagi, tinggal buka ban + kembalikan role — bukan buat ulang
+//   akun dari nol.
 
 module.exports = async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -19,6 +15,19 @@ module.exports = async (req, res) => {
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const ANON = process.env.SUPABASE_ANON_KEY;
   const SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  const parseBody = (rawBody) => {
+    if (typeof rawBody !== "string") return rawBody || {};
+    try { return JSON.parse(rawBody); }
+    catch { throw new Error("Body request tidak valid."); }
+  };
+
+  const getJsonOrText = async (resp) => {
+    const text = await resp.text();
+    if (!text) return null;
+    try { return JSON.parse(text); }
+    catch { return text; }
+  };
 
   try {
     if (!SUPABASE_URL || !ANON || !SERVICE) {
@@ -29,10 +38,9 @@ module.exports = async (req, res) => {
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : null;
     if (!token) return res.status(401).json({ error: "Butuh Authorization Bearer token (owner harus login)." });
 
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
-    const target_user_id = body?.target_user_id;
-    const target_email = body?.target_email || null;
-    const reason = String(body?.reason || "").trim();
+    const body = parseBody(req.body);
+    const target_user_id = String(body?.target_user_id || "").trim();
+    const reason = String(body?.reason || "").trim() || null;
 
     if (!target_user_id) return res.status(400).json({ error: "target_user_id wajib." });
 
@@ -40,35 +48,44 @@ module.exports = async (req, res) => {
     const userResp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
       headers: { apikey: ANON, Authorization: `Bearer ${token}` },
     });
-    const userJson = await userResp.json();
-    if (!userResp.ok) return res.status(401).json({ error: userJson?.msg || userJson?.error || "Token owner tidak valid." });
+    const userJson = await getJsonOrText(userResp);
+    if (!userResp.ok) {
+      return res.status(401).json({ error: userJson?.msg || userJson?.error || "Token owner tidak valid." });
+    }
     const ownerId = userJson?.id;
     if (!ownerId) return res.status(401).json({ error: "Tidak bisa membaca owner id." });
+    if (ownerId === target_user_id) {
+      return res.status(403).json({ error: "Owner tidak boleh menonaktifkan akunnya sendiri dari aplikasi." });
+    }
 
     // 2) Cek role owner dari tabel profiles (pakai service role)
     const profResp = await fetch(
       `${SUPABASE_URL}/rest/v1/profiles?select=role&user_id=eq.${ownerId}&limit=1`,
       { headers: { apikey: SERVICE, Authorization: `Bearer ${SERVICE}` } }
     );
-    const profJson = await profResp.json();
+    const profJson = await getJsonOrText(profResp);
     const ownerRole = Array.isArray(profJson) && profJson[0]?.role;
-    if (ownerRole !== "owner") return res.status(403).json({ error: "Hanya owner yang boleh menghapus akun." });
+    if (ownerRole !== "owner") {
+      return res.status(403).json({ error: "Hanya owner yang boleh menonaktifkan akun." });
+    }
 
-    // 3) Cek role target supaya tidak bisa hapus owner
+    // 3) Cek role target supaya tidak bisa nonaktifkan owner, dan supaya
+    //    tidak nonaktifkan akun yang sudah nonaktif (idempoten & jelas pesannya)
     const targetResp = await fetch(
-      `${SUPABASE_URL}/rest/v1/profiles?select=role,email&user_id=eq.${target_user_id}&limit=1`,
+      `${SUPABASE_URL}/rest/v1/profiles?select=user_id,role,email,display_name,branchId,investorId&user_id=eq.${target_user_id}&limit=1`,
       { headers: { apikey: SERVICE, Authorization: `Bearer ${SERVICE}` } }
     );
-    const targetJson = await targetResp.json();
-    const targetRole = Array.isArray(targetJson) && targetJson[0]?.role;
-    const targetEmailFromDb = Array.isArray(targetJson) ? targetJson[0]?.email : null;
-    if (!targetRole) return res.status(404).json({ error: "Target user tidak ditemukan di profiles." });
-    if (targetRole === "owner") return res.status(403).json({ error: "Akun owner tidak boleh dihapus dari aplikasi." });
+    const targetJson = await getJsonOrText(targetResp);
+    const targetProfile = Array.isArray(targetJson) ? targetJson[0] : null;
+    const targetRole = targetProfile?.role;
 
-    // 4) SOFT-DELETE: cabut akses login (ban ~100 tahun), TIDAK hapus user dari Auth.
-    //    "banned_until" dipakai GoTrue untuk menolak login & refresh token baru.
-    //    Sesi/JWT yang sedang aktif akan tetap valid sampai kedaluwarsa (biasanya
-    //    1 jam), lalu otomatis tidak bisa refresh lagi.
+    if (!targetRole) return res.status(404).json({ error: "Target user tidak ditemukan di profiles." });
+    if (targetRole === "owner") return res.status(403).json({ error: "Akun owner tidak boleh dinonaktifkan dari aplikasi." });
+    if (targetRole === "none") return res.status(409).json({ error: "Akun ini sudah nonaktif sebelumnya." });
+
+    // 4) BAN akses login (BUKAN hapus). ban_duration ~100 tahun = efektif
+    //    permanen sampai owner cabut manual. Baris auth.users TETAP ADA,
+    //    jadi bisa di-unban kapan saja tanpa buat akun baru.
     const banResp = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${target_user_id}`, {
       method: "PUT",
       headers: {
@@ -76,51 +93,46 @@ module.exports = async (req, res) => {
         Authorization: `Bearer ${SERVICE}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ ban_duration: "876000h" }), // ~100 tahun
+      body: JSON.stringify({ ban_duration: "876000h" }),
     });
     if (!banResp.ok) {
-      const t = await banResp.text();
-      return res.status(400).json({ error: `Gagal mencabut akses login: ${t}` });
+      const banErr = await getJsonOrText(banResp);
+      return res.status(400).json({ error: `Gagal mencabut akses login: ${banErr?.msg || banErr?.error || banErr || "unknown error"}` });
     }
 
-    // 5) Tandai status di tabel profiles (histori & data bisnis TETAP ada, tidak dihapus)
-    const patchResp = await fetch(
-      `${SUPABASE_URL}/rest/v1/profiles?user_id=eq.${target_user_id}`,
-      {
-        method: "PATCH",
-        headers: {
-          apikey: SERVICE,
-          Authorization: `Bearer ${SERVICE}`,
-          "Content-Type": "application/json",
-          Prefer: "return=minimal",
-        },
-        body: JSON.stringify({
-          status: "deleted",
-          deleted_at: new Date().toISOString(),
-          deleted_by: ownerId,
-          deleted_reason: reason || null,
-        }),
-      }
-    );
-    if (!patchResp.ok) {
-      const t = await patchResp.text();
-      // Login sudah dicabut tapi profil gagal ditandai — tetap laporkan sebagai error
-      // supaya owner tahu perlu retry, daripada status jadi tidak konsisten diam-diam.
-      return res.status(400).json({ error: `Akses login sudah dicabut, tapi gagal update status profil: ${t}` });
+    // 5) Tandai profil nonaktif. Sengaja TIDAK mengubah email/branchId/
+    //    investorId/display_name — data asli dipertahankan supaya histori
+    //    (transaksi, absensi, gaji) tetap nyambung dan akun bisa
+    //    diaktifkan lagi persis seperti semula kalau perlu.
+    const profileUpdateResp = await fetch(`${SUPABASE_URL}/rest/v1/profiles?user_id=eq.${target_user_id}`, {
+      method: "PATCH",
+      headers: {
+        apikey: SERVICE,
+        Authorization: `Bearer ${SERVICE}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({ role: "none" }),
+    });
+
+    const warnings = [];
+    if (!profileUpdateResp.ok) {
+      // Login sudah keburu diban di langkah 4. Kalau ini gagal, laporkan
+      // dengan jelas supaya owner tahu harus cek manual — jangan diam-diam.
+      const patchErr = await getJsonOrText(profileUpdateResp);
+      warnings.push(`Akses login sudah dicabut, TAPI status profil gagal diupdate: ${patchErr?.message || patchErr || "unknown error"}. Cek manual di Supabase.`);
     }
 
-    // 6) Bersihkan invites pending jika email diketahui (opsional, tidak mempengaruhi histori)
-    const finalEmail = target_email || targetEmailFromDb;
-    if (finalEmail) {
-      await fetch(`${SUPABASE_URL}/rest/v1/invites?email=eq.${encodeURIComponent(finalEmail)}`, {
-        method: "DELETE",
-        headers: { apikey: SERVICE, Authorization: `Bearer ${SERVICE}` },
-      }).catch(() => {});
-    }
-
-    return res.json({ ok: true, userId: target_user_id, softDeleted: true });
+    return res.json({
+      ok: true,
+      userId: target_user_id,
+      deactivated: true,
+      previousRole: targetRole,
+      reason,
+      deactivatedAt: new Date().toISOString(),
+      warnings,
+    });
   } catch (e) {
     return res.status(500).json({ error: e?.message || String(e) });
   }
 };
-
