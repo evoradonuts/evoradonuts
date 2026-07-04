@@ -1830,6 +1830,8 @@ function useConfirm() {
     const txs = S.get("transactions") || [];
     const pL = S.get("pengeluaranLapak") || [];
     const pO = S.get("pengeluaranOwner") || [];
+    const profilesAll = S.get("profiles") || [];
+    const investorsAll = S.get("investors") || [];
     const fTxs = txs.filter((t) => t.date >= dr.from && t.date <= dr.to && (selBranch === "all" || t.branchId === selBranch));
     const fPL = pL.filter((p) => p.date >= dr.from && p.date <= dr.to && (selBranch === "all" || p.branchId === selBranch));
     const fPO = pO.filter((p) => p.date >= dr.from && p.date <= dr.to && (selBranch === "all" || !p.branchId || p.branchId === selBranch));
@@ -1848,12 +1850,24 @@ function useConfirm() {
     const danaPemList = S.get("danaPemeliharaan") || [];
     const saldoDanaPemeliharaan = danaPemList.reduce((a, d) => a + (d.tipe === "setor" ? d.jumlah : -d.jumlah), 0);
     const menusAll = S.get("menuVarian") || [];
+    // Biaya global/pusat (pengeluaranOwner tanpa branchId) dibagi rata ke semua
+    // cabang lapak yang aktif — pembagi dihitung dari TOTAL cabang, bukan dari
+    // jumlah cabang yang sedang tampil, supaya filter 1-cabang tidak membuat
+    // cabang itu kelihatan menanggung 100% biaya global.
+    const nBranchForSplit = Math.max(branches.filter((b) => b.type !== "central_kitchen").length, 1);
+    const pOGlobal = fPO.filter((p) => !p.branchId);
+    const pOGlobalPerBranch = pOGlobal.reduce((a, p) => a + p.jumlah, 0) / nBranchForSplit;
     const branchStats = branches
       .filter((b) => b.type !== "central_kitchen")
       .filter((b) => selBranch === "all" || b.id === selBranch)
       .map((b) => {
         const bTx = fTxs.filter((t) => t.branchId === b.id);
-        const bPL = fPL.filter((p) => p.branchId === b.id).reduce((a, p) => a + p.jumlah, 0);
+        const bPLList = fPL.filter((p) => p.branchId === b.id);
+        const bPL = bPLList.reduce((a, p) => a + p.jumlah, 0);
+        const bPOList = fPO.filter((p) => p.branchId === b.id);
+        const bPOdirect = bPOList.reduce((a, p) => a + p.jumlah, 0);
+        const bPengOwner = bPOdirect + pOGlobalPerBranch;
+        const bPeng = bPL + bPengOwner;
         const bO = bTx.reduce((a, t) => a + t.total, 0);
         const bHppTerjual = bTx.reduce((a, t) => a + t.totalHPP, 0);
         const bDistrib = fDistrib.filter((d) => d.branchId === b.id);
@@ -1865,7 +1879,16 @@ function useConfirm() {
           const md = menusAll.find((m) => m.id === it.menuId);
           if (md?.tipe === "paket") boxTerjual += it.qty; else pcsTerjual += it.qty;
         }));
-        return { ...b, omzet: bO, modal: bHppDistrib, hppTerjual: bHppTerjual, hppTidakLaku: bHppTidakLaku, peng: bPL, laba: bO - bHppDistrib - bPL, txCount: bTx.length, boxTerjual, pcsTerjual };
+        // Pekerja SUNGGUHAN yang akunnya terhubung ke cabang ini (dari tabel
+        // profiles) — menimpa field "workers" lama yang cuma teks manual di
+        // form Tambah Cabang dan bisa nyasar/telat sinkron dari akun asli.
+        const workerProfiles = profilesAll.filter((p) => p.role === "worker" && p.branchId === b.id);
+        return {
+          ...b, workers: workerProfiles, omzet: bO, modal: bHppDistrib, hppTerjual: bHppTerjual, hppTidakLaku: bHppTidakLaku,
+          peng: bPeng, pengLapak: bPL, pengLapakCount: bPLList.length,
+          pengOwner: bPengOwner, pengOwnerCount: bPOList.length, pengGlobalShare: pOGlobalPerBranch,
+          laba: bO - bHppDistrib - bPeng, txCount: bTx.length, distribCount: bDistrib.length, boxTerjual, pcsTerjual
+        };
       });
     const mc = {};
     fTxs.forEach((t) => t.items.forEach((it) => { mc[it.nama] = (mc[it.nama] || 0) + it.qty; }));
@@ -1925,8 +1948,12 @@ function useConfirm() {
       },
       laba: {
         title: "Rincian Laba Bersih", total: laba, totalLabel: "Laba Bersih",
-        note: "Laba Bersih = Omzet − HPP Bahan − Pengeluaran, per cabang untuk periode ini.",
-        rows: branchStats.map((b) => ({ label: b.name, sub: "Omzet " + fmtRp(b.omzet) + " − HPP " + fmtRp(b.modal) + " − Peng " + fmtRp(b.peng), value: b.laba }))
+        note: "Laba = Omzet − HPP Bahan − Pengeluaran Lapak − Pengeluaran Owner (termasuk bagian rata biaya global/pusat seperti gaji & sewa yang tidak diikat ke satu cabang).",
+        rows: branchStats.map((b) => ({
+          label: b.name,
+          sub: "Omzet " + fmtRp(b.omzet) + " (" + b.txCount + "x transaksi) − HPP " + fmtRp(b.modal) + " (" + b.distribCount + "x distribusi) − Peng Lapak " + fmtRp(b.pengLapak) + " (" + b.pengLapakCount + " entri) − Peng Owner " + fmtRp(b.pengOwner) + " (" + b.pengOwnerCount + " entri" + (b.pengGlobalShare > 0 ? " + bagi rata global " + fmtRp(b.pengGlobalShare) : "") + ")",
+          value: b.laba
+        }))
       },
       tx: {
         title: "Rincian Transaksi", total: fTxs.length, totalLabel: "Total Transaksi", isCount: true,
@@ -1944,8 +1971,20 @@ function useConfirm() {
         }))
       },
       cabang: {
-        title: "Daftar Cabang", total: branches.filter((b) => b.type !== "central_kitchen").length, totalLabel: "Total Cabang", isCount: true,
-        rows: branches.filter((b) => b.type !== "central_kitchen").map((b) => ({ label: b.name, value: b.type, isText: true }))
+        title: "Daftar Cabang", total: branchStats.length, totalLabel: "Total Cabang", isCount: true,
+        note: "Pekerja di sini diambil dari akun login yang benar-benar terhubung ke cabang (bukan cuma catatan nama di halaman Cabang).",
+        rows: branchStats.map((b) => {
+          const workers = b.workers || [];
+          const tipeLabel = b.type === "investasi" ? "Investasi" : b.type === "central_kitchen" ? "Central Kitchen" : "Mandiri";
+          const investorNama = b.type === "investasi" ? (investorsAll.find((i) => i.id === b.investorId)?.nama || "-") : null;
+          const subParts = [
+            tipeLabel,
+            workers.length + " pekerja" + (workers.length ? ": " + workers.map((w) => w.display_name || w.displayName || w.email || "-").join(", ") : "")
+          ];
+          if (investorNama) subParts.push("Investor: " + investorNama);
+          subParts.push(b.txCount + "x transaksi periode ini");
+          return { label: b.name, sub: subParts.join(" • "), value: b.omzet };
+        })
       }
     };
 
@@ -1997,7 +2036,7 @@ function useConfirm() {
                   React.createElement("span", { className: "branch-stat-arrow" }, "\u25BC")
                 )
               ),
-              b.workers?.length > 0 && React.createElement("div", { className: "branch-workers" }, b.workers.join(", ")),
+              b.workers?.length > 0 && React.createElement("div", { className: "branch-workers" }, b.workers.map((w) => w.display_name || w.displayName || w.email || "-").join(", ")),
               React.createElement("div", { className: "branch-stat-body" },
                 React.createElement("div", { className: "branch-stat-row" }, React.createElement("span", null, "Omzet"), React.createElement("strong", null, fmtRp(b.omzet))),
                 React.createElement("div", { className: "branch-stat-row" }, React.createElement("span", null, "HPP"), React.createElement("strong", null, fmtRp(b.modal))),
@@ -2325,7 +2364,7 @@ function useConfirm() {
 
     const txsAll = (S.get("transactions") || []).filter((t) => t.date === date && (selBranch === "all" || t.branchId === selBranch));
     const pL = (S.get("pengeluaranLapak") || []).filter((p) => p.date === date && (selBranch === "all" || p.branchId === selBranch));
-    const pO = (S.get("pengeluaranOwner") || []).filter((p) => p.date === date);
+    const pO = (S.get("pengeluaranOwner") || []).filter((p) => p.date === date && (selBranch === "all" || !p.branchId || p.branchId === selBranch));
     const distribAllRpt = (S.get("distribusiCK") || []).filter((d) => d.date === date && (selBranch === "all" || d.branchId === selBranch));
     const editLogs = (S.get("editLog") || []).filter((l) => selBranch === "all" || l.branchId === selBranch);
     const omzet = txsAll.reduce((a, t) => a + t.total, 0);
