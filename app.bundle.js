@@ -265,8 +265,12 @@ var DonatBoss = (() => {
     const ckByDate = {};
     poCk.forEach((p) => { ckByDate[p.date] = (ckByDate[p.date] || 0) + (p.jumlah || 0); });
 
+    // Distribusi yang sudah "dibatalkan" (fitur Retur — lihat OwnerProduksiCK)
+    // DIBUANG dari perhitungan proporsi: pcs itu sudah ditarik balik & tidak lagi
+    // mewakili ongkos CK yang sungguhan menopang cabang tsb.
+    const distribAktif = (distribAll || []).filter((d) => d.status !== "dibatalkan");
     const pcsByDateBranch = {};
-    (distribAll || []).forEach((d) => {
+    distribAktif.forEach((d) => {
       if (!perBranch.hasOwnProperty(d.branchId)) return;
       pcsByDateBranch[d.date] = pcsByDateBranch[d.date] || {};
       pcsByDateBranch[d.date][d.branchId] = (pcsByDateBranch[d.date][d.branchId] || 0) + (d.jumlahKirim || 0);
@@ -309,10 +313,16 @@ var DonatBoss = (() => {
     const branchesInScope = branchesNonCK.filter((b) => matchBranch(b.id));
     const nBranchForSplit = Math.max(branchesNonCK.length, 1);
 
+    // Distribusi berstatus "dibatalkan" (fitur Retur) dibuang SEKALI di sini —
+    // supaya tidak perlu diingat-ingat lagi di setiap turunan (fDistrib,
+    // fDistribCk) di bawah. Distribusi yang diretur sudah ditarik balik
+    // stoknya, jadi tidak boleh lagi dihitung sbg HPP/ongkos di laporan manapun.
+    const distribAllAktif = (distribAll || []).filter((d) => d.status !== "dibatalkan");
+
     const fTxs = (txs || []).filter((t) => t.date >= dateFrom && t.date <= dateTo && matchBranch(t.branchId));
     const fPL = (pL || []).filter((p) => p.date >= dateFrom && p.date <= dateTo && matchBranch(p.branchId));
     const fPO = (pO || []).filter((p) => p.date >= dateFrom && p.date <= dateTo && (!p.branchId || matchBranch(p.branchId)));
-    const fDistrib = (distribAll || []).filter((d) => d.date >= dateFrom && d.date <= dateTo && matchBranch(d.branchId));
+    const fDistrib = distribAllAktif.filter((d) => d.date >= dateFrom && d.date <= dateTo && matchBranch(d.branchId));
     const fStokTidakTerjual = (stokTidakTerjualAll || []).filter((s) => s.date >= dateFrom && s.date <= dateTo && matchBranch(s.branchId));
 
     const omzet = fTxs.reduce((a, t) => a + (t.total || 0), 0);
@@ -326,7 +336,7 @@ var DonatBoss = (() => {
     // yang sedang dilihat cuma 1 cabang atau 1 tipe — baru diambil porsi yang
     // relevan untuk scope saat ini.
     const fPOCk = (pO || []).filter((p) => p.date >= dateFrom && p.date <= dateTo);
-    const fDistribCk = (distribAll || []).filter((d) => d.date >= dateFrom && d.date <= dateTo);
+    const fDistribCk = distribAllAktif.filter((d) => d.date >= dateFrom && d.date <= dateTo);
     // BUG AUDIT (ditemukan saat verifikasi refactor #1.4): sebelumnya baris
     // ini mengirim "branchesNonCK" (cabang CK sudah dibuang duluan) ke
     // hitungBiayaCkPerCabang — padahal fungsi itu PERLU tahu cabang mana yang
@@ -1912,11 +1922,13 @@ function useConfirm() {
   // ─── OwnerProduksiCK — Rekap + Distribusi CK ────────────────────────────────
   function OwnerProduksiCK({ pushNotif }) {
     const tick = useStoreTick();
+    const [confirmAsk, confirmModal] = useConfirm();
     const [dr, setDr] = useState({ from: today(), to: today() });
     const [subtab, setSubtab] = useState("produksi");
     const [distribForm, setDistribForm] = useState({});
     const [distribBusy, setDistribBusy] = useState({});
     const [openDay, setOpenDay] = useState({});
+    const [returBusy, setReturBusy] = useState({});
     const branches = (S.get("branches") || []).filter((b) => b.type !== "central_kitchen");
     const menus = S.get("menuVarian") || [];
     const produksiAll = S.get("produksiCK") || [];
@@ -1961,9 +1973,13 @@ function useConfirm() {
     filtered.forEach((p) => { if (!byDate[p.date]) byDate[p.date] = []; byDate[p.date].push(p); });
     const byDateArr = Object.entries(byDate).sort((a, b) => b[0].localeCompare(a[0]));
 
-    const sudahDistrib = (prodId) => distribAll.some((d) => d.produksiId === prodId);
+    // "dibatalkan" (lihat batalkanDistribusi di bawah) SENGAJA tidak dihitung sbg
+    // distribusi aktif — begitu dibatalkan, jatah pcs-nya kembali tersedia utk
+    // didistribusikan ulang, dan badge "Sudah didistribusikan" ikut hilang kalau
+    // semuanya sudah dibatalkan.
+    const sudahDistrib = (prodId) => distribAll.some((d) => d.produksiId === prodId && d.status !== "dibatalkan");
     // Total pcs yang SUDAH dikirim untuk 1 produksi (bisa dari beberapa kali kirim bertahap).
-    const getTotalTerdistribusi = (prodId) => distribAll.filter((d) => d.produksiId === prodId).reduce((a, d) => a + (d.jumlahKirim || 0), 0);
+    const getTotalTerdistribusi = (prodId) => distribAll.filter((d) => d.produksiId === prodId && d.status !== "dibatalkan").reduce((a, d) => a + (d.jumlahKirim || 0), 0);
     const getSisaBelumDistribusi = (p) => Math.max((p.jumlah || 0) - getTotalTerdistribusi(p.id), 0);
     const getDistribForm = (prodId) => distribForm[prodId] || {};
     const setDistribEntry = (prodId, branchId, val) => setDistribForm((f) => ({ ...f, [prodId]: { ...(f[prodId] || {}), [branchId]: val } }));
@@ -2002,8 +2018,122 @@ function useConfirm() {
 
     const distribPending = distribAll.filter((d) => d.status === "pending");
     const distribDiterima = distribAll.filter((d) => d.status === "diterima");
+    const distribDibatalkan = distribAll.filter((d) => d.status === "dibatalkan");
     const distribSelisih = distribAll.filter((d) => d.status === "diterima" && d.selisih !== 0);
     const distribFiltered = distribAll.filter((d) => d.date >= dr.from && d.date <= dr.to);
+
+    // ─── Hapus Produksi — DIPERBAIKI (lihat checklist audit "Hapus Produksi tidak
+    // cascade ke Distribusi"). Sebelumnya tombol ini langsung hapus tanpa cek
+    // apa-apa, padahal distribusiCK adalah tabel TERPISAH yang tidak pernah ikut
+    // terhapus otomatis, dan kalau distribusinya sudah "diterima", stok lapak
+    // sudah benar-benar bertambah nyata di database. 3 skenario:
+    //   1. Belum pernah didistribusikan sama sekali        -> aman hapus langsung.
+    //   2. Sudah didistribusikan tapi SEMUA masih Pending   -> aman, hapus produksi
+    //      SEKALIGUS semua baris distribusi pending-nya (belum ada stok yg berubah).
+    //   3. Ada distribusi yang SUDAH Diterima (stok sudah nambah) -> BLOKIR hapus
+    //      langsung, arahkan ke tombol "Batalkan/Retur" di tab Distribusi supaya
+    //      stok ditarik balik dengan benar dulu, baru produksi boleh dihapus.
+    const hapusProduksi = (p) => {
+      const related = distribAll.filter((d) => d.produksiId === p.id && d.status !== "dibatalkan");
+
+      if (related.length === 0) {
+        confirmAsk({
+          title: "Hapus Produksi",
+          message: `Hapus catatan produksi "${p.menuNama}" (${p.jumlah} pcs, ${formatTanggalIndo(p.date)})? Belum pernah didistribusikan, aman dihapus.`,
+          danger: true,
+          confirmLabel: "Hapus",
+          onConfirm: async () => {
+            S.set("produksiCK", (S.get("produksiCK") || []).filter((x) => x.id !== p.id));
+            pushNotif("Produksi dihapus.", "warning");
+          },
+        });
+        return;
+      }
+
+      const diterima = related.filter((d) => d.status === "diterima");
+      const pending = related.filter((d) => d.status === "pending");
+
+      if (diterima.length === 0) {
+        const rincian = pending.map((d) => `${d.branchName} (${d.jumlahKirim} pcs, belum dikonfirmasi)`).join(", ");
+        confirmAsk({
+          title: "Hapus Produksi + Distribusinya",
+          message: `Produksi ini sudah didistribusikan ke: ${rincian} — tapi SEMUA masih Pending, jadi belum ada stok yang berubah. Menghapus produksi ini akan IKUT MENGHAPUS ${pending.length} catatan distribusi tsb sekaligus. Lanjutkan?`,
+          danger: true,
+          confirmLabel: "Hapus Semua",
+          onConfirm: async () => {
+            const idsToDelete = new Set(pending.map((d) => d.id));
+            S.set("distribusiCK", (S.get("distribusiCK") || []).filter((x) => !idsToDelete.has(x.id)));
+            S.set("produksiCK", (S.get("produksiCK") || []).filter((x) => x.id !== p.id));
+            pushNotif(`Produksi & ${pending.length} distribusi pending-nya berhasil dihapus.`, "warning");
+          },
+        });
+        return;
+      }
+
+      const rincianDiterima = diterima.map((d) => `${d.branchName}: ${d.jumlahTerima ?? d.jumlahKirim} pcs (SUDAH menambah stok)`).join(", ");
+      const rincianPending = pending.length > 0 ? ` Selain itu masih Pending: ${pending.map((d) => `${d.branchName} (${d.jumlahKirim} pcs)`).join(", ")}.` : "";
+      confirmAsk({
+        title: "⚠️ Tidak Bisa Dihapus Langsung",
+        message: `Produksi ini sudah didistribusikan dan SUDAH DIKONFIRMASI DITERIMA di: ${rincianDiterima}.${rincianPending}\n\nMenghapus produksi di sini TIDAK akan menarik balik stok yang sudah bertambah itu — datanya akan tidak sinkron dengan stok fisik. Buka tab "Distribusi", cari baris yang berstatus Diterima itu, lalu pakai tombol "Batalkan/Retur" untuk menarik balik stoknya dengan benar. Setelah semua baris distribusi produksi ini beres (dihapus/dibatalkan), baru produksi ini bisa dihapus.`,
+        confirmLabel: "Mengerti",
+        onConfirm: async () => {},
+      });
+    };
+
+    // ─── Batalkan/Retur Distribusi yang sudah Diterima ──────────────────────
+    // Menandai distribusiCK jadi "dibatalkan" (BUKAN dihapus — supaya jejak
+    // auditnya tetap ada) + menarik balik stok lapak sejumlah yang tadinya
+    // ditambahkan. Kalau stok saat ini sudah kurang dari itu (sebagian sudah
+    // kejual/kepakai), stok disetel ke 0 (tidak sampai minus) dan ownernya
+    // diberi tahu jelas berapa pcs yang "hilang" (kemungkinan sudah terjual).
+    const batalkanDistribusi = (d) => {
+      const jmlTarik = d.jumlahTerima != null ? d.jumlahTerima : d.jumlahKirim;
+      confirmAsk({
+        title: "Batalkan / Retur Distribusi",
+        message: `Ini akan menandai distribusi "${d.menuNama}" ke ${d.branchName} (${jmlTarik} pcs) sebagai DIBATALKAN, dan MENGURANGI stok ${d.branchName} sebesar ${jmlTarik} pcs. Kalau stok yang tersisa di sana sekarang lebih sedikit dari ${jmlTarik} pcs (misal sudah kejual), stok akan disetel ke 0 dan kamu akan diberi tahu selisihnya — bukan dibuat minus. Tulis alasan pembatalan (wajib, tersimpan permanen):`,
+        requireText: true,
+        textLabel: "Alasan pembatalan",
+        textPlaceholder: "Contoh: salah input produksi, distribusi keliru...",
+        confirmLabel: "Batalkan & Tarik Stok",
+        danger: true,
+        onConfirm: async (alasan) => {
+          if (!alasan || !alasan.trim()) {
+            pushNotif("Alasan wajib diisi.", "warning");
+            throw new Error("Alasan kosong");
+          }
+          setReturBusy((b) => ({ ...b, [d.id]: true }));
+          try {
+            const stoks = S.get("stokLapak") || [];
+            const existing = stoks.find((s) => s.branchId === d.branchId && s.menuId === d.menuId);
+            const stokSaatIni = existing?.stok || 0;
+            const stokBaru = Math.max(stokSaatIni - jmlTarik, 0);
+            const kekurangan = jmlTarik - stokSaatIni; // > 0 = sebagian sudah kejual/hilang sebelum retur
+            await upsertStokLapak(d.branchId, d.menuId, stokBaru, existing);
+            await S.loadKey("stokLapak");
+
+            const { data: sess } = await sb.auth.getSession();
+            const uid = sess?.session?.user?.id || null;
+            const { error } = await sb.from("distribusiCK")
+              .update({ status: "dibatalkan", catatanBatal: alasan.trim(), batalAt: nowIso(), batalBy: uid })
+              .eq("id", d.id);
+            if (error) throw error;
+            await S.loadKey("distribusiCK");
+
+            pushNotif(
+              kekurangan > 0
+                ? `Distribusi dibatalkan. Stok ${d.branchName} cuma tersisa ${stokSaatIni} pcs (sudah ditarik jadi 0) — ${kekurangan} pcs dari distribusi ini sepertinya sudah terjual/terpakai sebelum dibatalkan, cek manual kalau perlu.`
+                : `Distribusi dibatalkan & ${jmlTarik} pcs stok ${d.branchName} sudah ditarik balik.`,
+              "warning"
+            );
+          } catch (e) {
+            pushNotif(e?.message || String(e), "warning");
+            throw e;
+          } finally {
+            setReturBusy((b) => { const c = { ...b }; delete c[d.id]; return c; });
+          }
+        },
+      });
+    };
 
     return React.createElement("div", null,
       React.createElement("h3", { className: "section-title mt8" }, "Produksi & Distribusi Central Kitchen"),
@@ -2084,12 +2214,16 @@ function useConfirm() {
                       ),
                       React.createElement("div", { className: "peng-right" },
                         React.createElement("span", { style: { color: "var(--green)", fontWeight: 700 } }, p.jumlah, " pcs"),
-                        React.createElement("button", { className: "btn-danger-sm", style: { marginLeft: 8 }, onClick: () => { if (!confirm("Hapus catatan ini?")) return; S.set("produksiCK", (S.get("produksiCK") || []).filter((x) => x.id !== p.id)); pushNotif("Dihapus.", "warning"); } }, "X")
+                        React.createElement("button", { className: "btn-danger-sm", style: { marginLeft: 8 }, onClick: () => hapusProduksi(p) }, "X")
                       )
                     ),
                     sudahDistrib(p.id) && React.createElement("div", { style: { marginTop: 6, padding: "6px 10px", background: "color-mix(in srgb, var(--green) 12%, var(--bg2))", borderRadius: 6, fontSize: 12, color: "var(--green)" } },
                       "✅ Sudah didistribusikan — ",
-                      distribAll.filter((d) => d.produksiId === p.id).map((d) => d.branchName + ": " + d.jumlahKirim + " pcs").join(", ")
+                      distribAll.filter((d) => d.produksiId === p.id && d.status !== "dibatalkan").map((d) => d.branchName + ": " + d.jumlahKirim + " pcs" + (d.status === "diterima" ? " (diterima)" : " (pending)")).join(", ")
+                    ),
+                    distribAll.some((d) => d.produksiId === p.id && d.status === "dibatalkan") && React.createElement("div", { style: { marginTop: 6, padding: "6px 10px", background: "color-mix(in srgb, var(--text2) 12%, var(--bg2))", borderRadius: 6, fontSize: 11, color: "var(--text2)" } },
+                      "🚫 Ada distribusi dari produksi ini yang sudah dibatalkan/diretur — ",
+                      distribAll.filter((d) => d.produksiId === p.id && d.status === "dibatalkan").map((d) => d.branchName + ": " + (d.jumlahTerima ?? d.jumlahKirim) + " pcs").join(", ")
                     ),
                     getSisaBelumDistribusi(p) <= 0
                       ? (sudahDistrib(p.id) && React.createElement("div", { style: { marginTop: 4, fontSize: 11, color: "var(--text2)" } }, "Seluruh hasil produksi ini sudah terdistribusi habis."))
@@ -2128,17 +2262,18 @@ function useConfirm() {
           React.createElement("div", { className: "kpi-card", style: { background: "color-mix(in srgb, var(--yellow) 10%, var(--bg2))", border: "1px solid #f59e0b" } }, React.createElement("div", { className: "kpi-label" }, "Menunggu Konfirmasi"), React.createElement("div", { className: "kpi-val", style: { color: "var(--yellow)" } }, distribPending.length, "x")),
           React.createElement("div", { className: "kpi-card kpi-profit" }, React.createElement("div", { className: "kpi-label" }, "Sudah Diterima"), React.createElement("div", { className: "kpi-val", style: { color: "var(--green)" } }, distribDiterima.length, "x")),
           distribSelisih.length > 0 && React.createElement("div", { className: "kpi-card kpi-peng" }, React.createElement("div", { className: "kpi-label" }, "Ada Selisih"), React.createElement("div", { className: "kpi-val", style: { color: "var(--red)" } }, distribSelisih.length, "x")),
+          distribDibatalkan.length > 0 && React.createElement("div", { className: "kpi-card", style: { background: "color-mix(in srgb, var(--text2) 10%, var(--bg2))" } }, React.createElement("div", { className: "kpi-label" }, "Dibatalkan"), React.createElement("div", { className: "kpi-val", style: { color: "var(--text2)" } }, distribDibatalkan.length, "x")),
           React.createElement("div", { className: "kpi-card kpi-modal" }, React.createElement("div", { className: "kpi-label" }, "Total HPP Distribusi"), React.createElement("div", { className: "kpi-val" }, fmtRp(distribFiltered.reduce((a, d) => a + (d.hppTotal || 0), 0))))
         ),
         React.createElement("div", { className: "tbl-wrap mt12" },
           React.createElement("table", { className: "tbl" },
             React.createElement("thead", null, React.createElement("tr", null,
               React.createElement("th", null, "Tanggal"), React.createElement("th", null, "Produk"), React.createElement("th", null, "Cabang"),
-              React.createElement("th", null, "Kirim"), React.createElement("th", null, "Terima"), React.createElement("th", null, "Selisih"), React.createElement("th", null, "HPP"), React.createElement("th", null, "Status")
+              React.createElement("th", null, "Kirim"), React.createElement("th", null, "Terima"), React.createElement("th", null, "Selisih"), React.createElement("th", null, "HPP"), React.createElement("th", null, "Status"), React.createElement("th", null, "Aksi")
             )),
             React.createElement("tbody", null,
               distribFiltered.sort((a, b) => (b.date || "").localeCompare(a.date || "")).map((d) =>
-                React.createElement("tr", { key: d.id },
+                React.createElement("tr", { key: d.id, style: d.status === "dibatalkan" ? { opacity: 0.6 } : null },
                   React.createElement("td", { style: { fontSize: 11 } }, formatTanggalIndoPendek(d.date)),
                   React.createElement("td", null, React.createElement("strong", null, d.menuNama)),
                   React.createElement("td", null, d.branchName),
@@ -2150,17 +2285,25 @@ function useConfirm() {
                   ),
                   React.createElement("td", { style: { fontSize: 11, color: "var(--text2)" } }, fmtRp(d.hppTotal || 0)),
                   React.createElement("td", null,
-                    d.status === "pending"
-                      ? React.createElement("span", { style: { color: "var(--yellow)", fontSize: 11, fontWeight: 700 } }, "Pending")
-                      : React.createElement("span", { style: { color: "var(--green)", fontSize: 11, fontWeight: 700 } }, "Diterima")
+                    d.status === "pending" ? React.createElement("span", { style: { color: "var(--yellow)", fontSize: 11, fontWeight: 700 } }, "Pending")
+                    : d.status === "dibatalkan" ? React.createElement("span", { style: { color: "var(--text2)", fontSize: 11, fontWeight: 700 } }, "Dibatalkan")
+                    : React.createElement("span", { style: { color: "var(--green)", fontSize: 11, fontWeight: 700 } }, "Diterima"),
+                    d.status === "dibatalkan" && d.catatanBatal ? React.createElement("div", { style: { fontSize: 10, color: "var(--text2)", marginTop: 2 } }, d.catatanBatal) : null
+                  ),
+                  React.createElement("td", null,
+                    d.status === "diterima" ? React.createElement("button", {
+                      className: "btn-danger-sm", style: { fontSize: 10 }, disabled: !!returBusy[d.id],
+                      onClick: () => batalkanDistribusi(d),
+                    }, returBusy[d.id] ? "..." : "Batalkan") : "-"
                   )
                 )
               ),
-              distribFiltered.length === 0 && React.createElement("tr", null, React.createElement("td", { colSpan: 8, style: { textAlign: "center", color: "var(--text2)", padding: 16 } }, "Belum ada distribusi di rentang ini."))
+              distribFiltered.length === 0 && React.createElement("tr", null, React.createElement("td", { colSpan: 9, style: { textAlign: "center", color: "var(--text2)", padding: 16 } }, "Belum ada distribusi di rentang ini."))
             )
           )
         )
-      )
+      ),
+      confirmModal
     );
   }
   // ─── OwnerDashboard ────────────────────────────────────────────────────────
@@ -5737,7 +5880,10 @@ function SettingAkun({ pushNotif }) {
       pushNotif?.("Laporan bulanan dikonfirmasi.", "success");
     };
 
-    const distribAllInv = S.get("distribusiCK") || [];
+    // Distribusi "dibatalkan" (fitur Retur di OwnerProduksiCK) dibuang di sini —
+    // sama seperti hitungPerformaPeriode — supaya laporan yang dilihat investor
+    // tidak ikut terbebani HPP dari distribusi yang sudah ditarik balik stoknya.
+    const distribAllInv = (S.get("distribusiCK") || []).filter((d) => d.status !== "dibatalkan");
     const allBranchesGlobal = S.get("branches") || [];
 
     // Helper: hitung akumulasi untuk rentang cabang + tanggal tertentu langsung dari transaksi
