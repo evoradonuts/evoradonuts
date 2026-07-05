@@ -6,12 +6,14 @@ var DonatBoss = (() => {
   // ─── Owner nav: dipakai bersama oleh App (sidebar) & OwnerPage (konten) ───
   var OWNER_TABS = [
     { key: "dashboard",  label: "Dashboard",    icon: "\uD83D\uDCCA" },
+    { key: "performaPeriode", label: "Performa", icon: "\uD83D\uDCC5" },
     { key: "kasir",      label: "Kasir",        icon: "\uD83D\uDED2" },
     { key: "setoran",    label: "Setoran",      icon: "\uD83D\uDCB0" },
     { key: "laporan",    label: "Laporan",      icon: "\uD83D\uDCC8" },
     { key: "absensi",    label: "Absensi",      icon: "\uD83D\uDD52" },
     { key: "pengeluaran",label: "Pengeluaran",  icon: "\uD83E\uDDFE" },
     { key: "produksiCK", label: "Produksi CK",  icon: "\uD83C\uDF69" },
+    { key: "tutupBuku",  label: "Tutup Buku",   icon: "\uD83D\uDCD5" },
     { key: "setting",    label: "Seting",       icon: "\u2699\uFE0F" },
   ];
 
@@ -235,6 +237,289 @@ var DonatBoss = (() => {
   };
 
   // ─── Helper: upsert stokLapak, toleran terhadap kolom lastUpdate yang mungkin belum ada ───
+  // ═══════════════════════════════════════════════════════════════════════
+  // hitungBiayaCkPerCabang — pembagi gaji/biaya Central Kitchen ke cabang
+  // penerima, PROPORSIONAL ke pcs yang diterima cabang itu pada tanggal yang
+  // sama (bukan rata). Cabang yang libur/tidak menerima distribusi hari itu
+  // otomatis dapat porsi 0 untuk hari tsb — sesuai keputusan owner.
+  // Kalau ada biaya CK di suatu tanggal tapi TIDAK ada distribusi tercatat
+  // hari itu (edge case), fallback ke bagi rata semua cabang non-CK supaya
+  // biayanya tidak hilang begitu saja dari laporan.
+  //
+  // "Biaya CK" didefinisikan sebagai entri pengeluaranOwner yang branchId-nya
+  // mengarah ke cabang bertipe central_kitchen — BUKAN berdasar teks kategori,
+  // karena kategori "gaji_kitchen" tetap bisa dialokasikan manual ke cabang lain.
+  //
+  // Dipakai oleh hitungPerformaPeriode, OwnerDashboard, dan TutupBuku — SATU
+  // tempat ini saja, supaya konsisten di semua laporan (lihat catatan di bawah).
+  // ═══════════════════════════════════════════════════════════════════════
+  function hitungBiayaCkPerCabang({ po, distribAll, branches }) {
+    const cabangNonCK = (branches || []).filter((b) => b.type !== "central_kitchen");
+    const ckBranchIds = new Set((branches || []).filter((b) => b.type === "central_kitchen").map((b) => b.id));
+    const perBranch = {};
+    cabangNonCK.forEach((b) => { perBranch[b.id] = 0; });
+    const poCk = (po || []).filter((p) => p.branchId && ckBranchIds.has(p.branchId));
+    const totalCk = poCk.reduce((a, p) => a + (p.jumlah || 0), 0);
+    if (totalCk <= 0 || cabangNonCK.length === 0) return { totalCk: 0, perBranch, ckBranchIds };
+
+    const ckByDate = {};
+    poCk.forEach((p) => { ckByDate[p.date] = (ckByDate[p.date] || 0) + (p.jumlah || 0); });
+
+    const pcsByDateBranch = {};
+    (distribAll || []).forEach((d) => {
+      if (!perBranch.hasOwnProperty(d.branchId)) return;
+      pcsByDateBranch[d.date] = pcsByDateBranch[d.date] || {};
+      pcsByDateBranch[d.date][d.branchId] = (pcsByDateBranch[d.date][d.branchId] || 0) + (d.jumlahKirim || 0);
+    });
+
+    Object.entries(ckByDate).forEach(([date, ckAmount]) => {
+      const pcsHariItu = pcsByDateBranch[date] || {};
+      const totalPcsHariItu = Object.values(pcsHariItu).reduce((a, v) => a + v, 0);
+      if (totalPcsHariItu > 0) {
+        Object.entries(pcsHariItu).forEach(([bId, pcs]) => { perBranch[bId] += ckAmount * (pcs / totalPcsHariItu); });
+      } else {
+        const n = cabangNonCK.length;
+        cabangNonCK.forEach((b) => { perBranch[b.id] += ckAmount / n; });
+      }
+    });
+
+    return { totalCk, perBranch, ckBranchIds };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // hitungPerformaPeriode — SATU-SATUNYA rumus laba/rugi di seluruh app.
+  // Dipakai oleh OwnerDashboard (harian), PerformaPeriode (mingguan/bulanan),
+  // dan TutupBuku. JANGAN buat rumus laba kedua di tempat lain — itu persis
+  // penyebab bug "laba Dashboard vs TutupBuku beda sendiri" yang sudah pernah
+  // kejadian. Kalau rumus perlu berubah, ubah SATU tempat ini saja.
+  //
+  // Gaji Central Kitchen SUDAH ikut dibagi ke cabang di sini, lewat
+  // hitungBiayaCkPerCabang() di atas — proporsional ke pcs distribusi harian.
+  // ═══════════════════════════════════════════════════════════════════════
+  function hitungPerformaPeriode({ txs, pL, pO, distribAll, stokTidakTerjualAll, gajiPembayaranAll, branches, investorsAll, dateFrom, dateTo, branchId, tipe }) {
+    const branchesNonCK = branches.filter((b) => b.type !== "central_kitchen");
+    const matchBranch = (bId) => {
+      if (branchId && branchId !== "all") return bId === branchId;
+      if (tipe && tipe !== "all") {
+        const b = branchesNonCK.find((x) => x.id === bId);
+        return b && (tipe === "investasi" ? b.type === "investasi" : b.type !== "investasi");
+      }
+      return true;
+    };
+    const branchesInScope = branchesNonCK.filter((b) => matchBranch(b.id));
+    const nBranchForSplit = Math.max(branchesNonCK.length, 1);
+
+    const fTxs = (txs || []).filter((t) => t.date >= dateFrom && t.date <= dateTo && matchBranch(t.branchId));
+    const fPL = (pL || []).filter((p) => p.date >= dateFrom && p.date <= dateTo && matchBranch(p.branchId));
+    const fPO = (pO || []).filter((p) => p.date >= dateFrom && p.date <= dateTo && (!p.branchId || matchBranch(p.branchId)));
+    const fDistrib = (distribAll || []).filter((d) => d.date >= dateFrom && d.date <= dateTo && matchBranch(d.branchId));
+    const fStokTidakTerjual = (stokTidakTerjualAll || []).filter((s) => s.date >= dateFrom && s.date <= dateTo && matchBranch(s.branchId));
+
+    const omzet = fTxs.reduce((a, t) => a + (t.total || 0), 0);
+    const hppTerjual = fTxs.reduce((a, t) => a + (t.totalHPP || 0), 0);
+    const hppDistribusi = fDistrib.reduce((a, d) => a + (d.hppTotal || 0), 0);
+    const hppTidakLaku = Math.max(hppDistribusi - hppTerjual, 0);
+    const donatTidakTerjual = fStokTidakTerjual.reduce((a, s) => a + (s.qtyTidakTerjual || 0), 0);
+
+    // CK split dihitung dari po/distribusi SATU BULAN PENUH tanpa filter cabang/tipe
+    // dulu (fPOCk/fDistribCk), supaya proporsi pcs per cabang selalu benar walau
+    // yang sedang dilihat cuma 1 cabang atau 1 tipe — baru diambil porsi yang
+    // relevan untuk scope saat ini.
+    const fPOCk = (pO || []).filter((p) => p.date >= dateFrom && p.date <= dateTo);
+    const fDistribCk = (distribAll || []).filter((d) => d.date >= dateFrom && d.date <= dateTo);
+    // BUG AUDIT (ditemukan saat verifikasi refactor #1.4): sebelumnya baris
+    // ini mengirim "branchesNonCK" (cabang CK sudah dibuang duluan) ke
+    // hitungBiayaCkPerCabang — padahal fungsi itu PERLU tahu cabang mana yang
+    // bertipe central_kitchen (ckBranchIds) untuk bisa mendeteksi biaya CK
+    // sama sekali. Efeknya: hitungPerformaPeriode (dipakai PerformaPeriode,
+    // dan sekarang juga OwnerDashboard & TutupBuku) selalu menghitung gaji
+    // CK = 0, membatalkan diam-diam perbaikan #1.4. Kirim "branches" APA
+    // ADANYA (termasuk cabang CK) — sama seperti OwnerDashboard/TutupBuku
+    // sebelum refactor, dan sama seperti hitungBiayaCkPerCabang sendiri
+    // butuhkan (ia yang menyaring cabangNonCK secara internal).
+    const ckSplit = hitungBiayaCkPerCabang({ po: fPOCk, distribAll: fDistribCk, branches });
+    const ckShareInScope = branchesInScope.reduce((a, b) => a + (ckSplit.perBranch[b.id] || 0), 0);
+
+    const pOGlobalTotal = fPO.filter((p) => !p.branchId).reduce((a, p) => a + (p.jumlah || 0), 0);
+    const pOGlobalPerBranch = pOGlobalTotal / nBranchForSplit;
+    const pOLangsungTotal = fPO.filter((p) => p.branchId && !ckSplit.ckBranchIds.has(p.branchId)).reduce((a, p) => a + (p.jumlah || 0), 0);
+    const pengLangsung = fPL.reduce((a, p) => a + (p.jumlah || 0), 0) + pOLangsungTotal;
+    // "Semua"/lebih dari 1 cabang dalam scope -> global dihitung penuh sekali.
+    // 1 cabang spesifik -> cuma porsi bagi ratanya. Ini yang bikin kartu KPI
+    // atas & tabel per-cabang selalu konsisten, tidak pernah beda sendiri.
+    const isSingleBranch = branchesInScope.length === 1 && !!branchId && branchId !== "all";
+    const peng = pengLangsung + (isSingleBranch ? pOGlobalPerBranch : pOGlobalTotal * (branchesInScope.length / nBranchForSplit)) + ckShareInScope;
+    const laba = omzet - hppDistribusi - peng;
+
+    const branchStats = branchesInScope.map((b) => {
+      const bTx = fTxs.filter((t) => t.branchId === b.id);
+      const bPLList = fPL.filter((p) => p.branchId === b.id);
+      const bPL = bPLList.reduce((a, p) => a + (p.jumlah || 0), 0);
+      const bPOList = fPO.filter((p) => p.branchId === b.id);
+      const bPOdirect = bPOList.reduce((a, p) => a + (p.jumlah || 0), 0);
+      const bGajiCk = ckSplit.perBranch[b.id] || 0;
+      const bPengOwner = bPOdirect + pOGlobalPerBranch + bGajiCk;
+      const bPeng = bPL + bPengOwner;
+      const bO = bTx.reduce((a, t) => a + (t.total || 0), 0);
+      const bHppTerjual = bTx.reduce((a, t) => a + (t.totalHPP || 0), 0);
+      const bDistrib = fDistrib.filter((d) => d.branchId === b.id);
+      const bHppDistrib = bDistrib.reduce((a, d) => a + (d.hppTotal || 0), 0);
+      const bHppTidakLaku = Math.max(bHppDistrib - bHppTerjual, 0);
+      const inv = b.type === "investasi" ? (investorsAll || []).find((i) => i.id === b.investorId) : null;
+      const bLaba = bO - bHppDistrib - bPeng;
+      return {
+        ...b, omzet: bO, modal: bHppDistrib, hppTerjual: bHppTerjual, hppTidakLaku: bHppTidakLaku,
+        peng: bPeng, pengLapak: bPL, pengLapakCount: bPLList.length,
+        pengOwner: bPengOwner, pengOwnerCount: bPOList.length, pengGlobalShare: pOGlobalPerBranch, pengGajiCk: bGajiCk,
+        laba: bLaba, txCount: bTx.length, distribCount: bDistrib.length,
+        investorId: inv?.id || null, investorNama: inv?.nama || null, persenBagi: inv?.persenBagi || 0,
+        bagianInvestor: inv ? bLaba * ((inv.persenBagi || 0) / 100) : null,
+      };
+    });
+
+    const sumTipe = (t) => {
+      const rows = branchStats.filter((b) => (t === "investasi" ? b.type === "investasi" : b.type !== "investasi"));
+      return {
+        omzet: rows.reduce((a, b) => a + b.omzet, 0), modal: rows.reduce((a, b) => a + b.modal, 0),
+        peng: rows.reduce((a, b) => a + b.peng, 0), laba: rows.reduce((a, b) => a + b.laba, 0),
+        txCount: rows.reduce((a, b) => a + b.txCount, 0),
+      };
+    };
+    const totalMandiri = sumTipe("mandiri");
+    const totalInvestasi = sumTipe("investasi");
+    const perInvestor = (investorsAll || []).map((inv) => {
+      const rows = branchStats.filter((b) => b.type === "investasi" && b.investorId === inv.id);
+      return {
+        investorId: inv.id, investorNama: inv.nama, persenBagi: inv.persenBagi || 0,
+        cabang: rows.map((r) => r.name),
+        omzet: rows.reduce((a, b) => a + b.omzet, 0), modal: rows.reduce((a, b) => a + b.modal, 0),
+        pengeluaran: rows.reduce((a, b) => a + b.peng, 0),
+        labaCabang: rows.reduce((a, b) => a + b.laba, 0),
+        bagianInvestor: rows.reduce((a, b) => a + (b.bagianInvestor || 0), 0),
+      };
+    }).filter((i) => i.cabang.length > 0);
+
+    return {
+      omzet, hppTerjual, hpp: hppDistribusi, hppDistribusi, hppTidakLaku, donatTidakTerjual,
+      peng, laba, labaBersih: laba, txCount: fTxs.length,
+      branchStats, totalMandiri, totalInvestasi, perInvestor,
+      // Ditambahkan (bukan mengubah yang sudah ada) supaya pemanggil lain
+      // (OwnerDashboard, TutupBuku) bisa pakai fungsi ini APA ADANYA untuk
+      // breakdown detail (kartu KPI, rincian per-kategori) tanpa perlu
+      // menghitung ulang split CK/global sendiri — itu yang dulu bikin
+      // rumus laba ke-copy-paste jadi 3 salinan terpisah di file ini.
+      ckSplit, pOGlobalPerBranch, pOGlobalTotal, nBranchForSplit, branchesInScope,
+      detail: { transaksi: fTxs, pengeluaranLapak: fPL, pengeluaranOwner: fPO, distribusiCK: fDistrib, stokTidakTerjual: fStokTidakTerjual },
+    };
+  }
+
+  // ─── PerformaPeriode — viewer performa Mingguan/Bulanan/Tahunan (READ-ONLY) ─
+  // Beda dari TutupBuku: ini murni untuk MELIHAT-LIHAT, tidak mengunci
+  // apapun. Bisa lihat minggu/bulan/tahun manapun, termasuk yang masih berjalan.
+  // Kalau periode yang dilihat kebetulan sudah pernah ditutup lewat TutupBuku
+  // (Bulanan/Tahunan), angkanya seharusnya SAMA (keduanya pakai
+  // hitungPerformaPeriode yang sama) — bedanya TutupBuku itu snapshot beku,
+  // ini selalu hitung ulang dari data terbaru (jadi kalau periode itu masih
+  // "terbuka"/belum ditutup dan datanya masih berubah, angka di sini ikut
+  // berubah real-time). Catatan untuk mode Tahunan: ini menghitung LANGSUNG
+  // dari data transaksi/pengeluaran mentah sepanjang tahun (live) — beda
+  // sumber dari TutupBukuTahunan yang mengagregasi dari snapshot BULANAN yang
+  // sudah resmi ditutup. Keduanya boleh beda sedikit kalau ada bulan yang
+  // belum ditutup atau datanya berubah setelah bulan itu ditutup.
+  function PerformaPeriode({ pushNotif }) {
+    const [granularitas, setGranularitas] = useState("bulan"); // "minggu" | "bulan" | "tahun"
+    const [anchor, setAnchor] = useState(() => today());
+    const [tipe, setTipe] = useState("all"); // "all" | "mandiri" | "investasi"
+
+    const branches = S.get("branches") || [];
+    const investorsAll = S.get("investors") || [];
+
+    const range = useMemo(() => {
+      if (granularitas === "tahun") {
+        const tahun = anchor.slice(0, 4);
+        return { from: tahun + "-01-01", to: tahun + "-12-31", label: "Tahun " + tahun };
+      }
+      if (granularitas === "bulan") {
+        const bulan = anchor.slice(0, 7);
+        const from = bulan + "-01";
+        const [y, m] = bulan.split("-").map(Number);
+        const to = new Date(m === 12 ? y + 1 : y, m === 12 ? 0 : m, 0).toISOString().slice(0, 10);
+        return { from, to, label: "Bulan " + bulan };
+      }
+      // Minggu: Senin s/d Minggu dari tanggal anchor
+      const d = new Date(anchor + "T00:00:00");
+      const dow = d.getDay(); // 0=Minggu
+      const diffToMonday = dow === 0 ? -6 : 1 - dow;
+      const mon = new Date(d); mon.setDate(d.getDate() + diffToMonday);
+      const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+      const from = mon.toISOString().slice(0, 10);
+      const to = sun.toISOString().slice(0, 10);
+      return { from, to, label: formatTanggalIndoPendek(from) + " – " + formatTanggalIndoPendek(to) };
+    }, [granularitas, anchor]);
+
+    const geser = (arah) => {
+      const d = new Date(anchor + "T00:00:00");
+      if (granularitas === "tahun") d.setFullYear(d.getFullYear() + arah);
+      else if (granularitas === "bulan") d.setMonth(d.getMonth() + arah);
+      else d.setDate(d.getDate() + arah * 7);
+      setAnchor(d.toISOString().slice(0, 10));
+    };
+
+    const hasil = useMemo(() => hitungPerformaPeriode({
+      txs: S.get("transactions") || [],
+      pL: S.get("pengeluaranLapak") || [],
+      pO: S.get("pengeluaranOwner") || [],
+      distribAll: S.get("distribusiCK") || [],
+      stokTidakTerjualAll: S.get("stokTidakTerjual") || [],
+      branches, investorsAll,
+      dateFrom: range.from, dateTo: range.to, branchId: "all", tipe,
+    }), [range.from, range.to, tipe, branches.length, investorsAll.length]);
+
+    return React.createElement("div", { className: "card" },
+      React.createElement("h3", null, "Performa " + (granularitas === "tahun" ? "Tahunan" : granularitas === "bulan" ? "Bulanan" : "Mingguan")),
+      React.createElement("div", { className: "tabs mb8" },
+        React.createElement("button", { className: "tab" + (granularitas === "minggu" ? " active" : ""), onClick: () => setGranularitas("minggu") }, "Mingguan"),
+        React.createElement("button", { className: "tab" + (granularitas === "bulan" ? " active" : ""), onClick: () => setGranularitas("bulan") }, "Bulanan"),
+        React.createElement("button", { className: "tab" + (granularitas === "tahun" ? " active" : ""), onClick: () => setGranularitas("tahun") }, "Tahunan")
+      ),
+      React.createElement("div", { className: "filter-bar mb8", style: { alignItems: "center" } },
+        React.createElement("button", { className: "btn-secondary btn-sm", onClick: () => geser(-1) }, "◀"),
+        React.createElement("strong", null, range.label),
+        React.createElement("button", { className: "btn-secondary btn-sm", onClick: () => geser(1) }, "▶"),
+        React.createElement("select", { className: "inp inp-sm", value: tipe, onChange: (e) => setTipe(e.target.value) },
+          React.createElement("option", { value: "all" }, "Semua Cabang"),
+          React.createElement("option", { value: "mandiri" }, "Cabang Mandiri"),
+          React.createElement("option", { value: "investasi" }, "Cabang Investasi")
+        )
+      ),
+      React.createElement("div", { className: "kpi-grid" },
+        React.createElement("div", { className: "kpi-card" }, React.createElement("div", { className: "kpi-label" }, "Omzet"), React.createElement("div", { className: "kpi-val" }, fmtRp(hasil.omzet))),
+        React.createElement("div", { className: "kpi-card" }, React.createElement("div", { className: "kpi-label" }, "HPP Bahan"), React.createElement("div", { className: "kpi-val" }, fmtRp(hasil.hpp))),
+        React.createElement("div", { className: "kpi-card" }, React.createElement("div", { className: "kpi-label" }, "Pengeluaran"), React.createElement("div", { className: "kpi-val" }, fmtRp(hasil.peng))),
+        React.createElement("div", { className: "kpi-card" }, React.createElement("div", { className: "kpi-label" }, "Laba Bersih"), React.createElement("div", { className: "kpi-val", style: { color: hasil.laba >= 0 ? "var(--green)" : "var(--red)" } }, fmtRp(hasil.laba))),
+        React.createElement("div", { className: "kpi-card" }, React.createElement("div", { className: "kpi-label" }, "Donat Tidak Terjual"), React.createElement("div", { className: "kpi-val" }, hasil.donatTidakTerjual, " pcs"))
+      ),
+      tipe === "all" && React.createElement("div", { className: "mt8", style: { border: "1px solid var(--border)", borderRadius: 8, padding: 10 } },
+        React.createElement("p", null, "Laba Cabang Mandiri: ", React.createElement("strong", null, fmtRp(hasil.totalMandiri.laba))),
+        React.createElement("p", null, "Laba Cabang Investasi (sebelum bagi hasil): ", React.createElement("strong", null, fmtRp(hasil.totalInvestasi.laba)))
+      ),
+      hasil.perInvestor.length > 0 && React.createElement("div", { className: "mt8" },
+        React.createElement("h4", null, "Bagian per Investor"),
+        hasil.perInvestor.map((inv) => React.createElement("div", { key: inv.investorId, style: { display: "flex", justifyContent: "space-between", padding: "4px 0" } },
+          React.createElement("span", null, inv.investorNama, " (", inv.persenBagi, "%)"),
+          React.createElement("strong", null, fmtRp(inv.bagianInvestor))
+        ))
+      ),
+      React.createElement("div", { className: "mt8" },
+        React.createElement("h4", null, "Per Cabang"),
+        hasil.branchStats.map((b) => React.createElement("div", { key: b.id, style: { display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid var(--border)" } },
+          React.createElement("span", null, b.name, " ", b.type === "investasi" ? "(Investasi)" : "(Mandiri)"),
+          React.createElement("span", null, "Omzet ", fmtRp(b.omzet), " · Laba ", fmtRp(b.laba))
+        ))
+      )
+    );
+  }
+
   var upsertStokLapak = async (branchId, menuId, newStok, existingRow) => {
     const payloadFull = { stok: newStok, lastUpdate: nowIso() };
     const payloadBasic = { stok: newStok };
@@ -306,6 +591,10 @@ var DonatBoss = (() => {
   var JADWAL_LIBUR_DB_KEY = "jadwal_libur";
   var JADWAL_LIBUR_ALLOWED_DAYS = new Set(["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"]);
   var isActiveProfile = (profile) => !!profile && profile.role !== "none" && profile.status !== "deleted" && !profile.deleted_at && !profile.deletedAt;
+  // Cek apakah setoran harian cabang+tanggal tertentu sudah dikonfirmasi & dikunci
+  // owner. Dipakai untuk menahan tombol "Edit Transaksi" supaya laporan yang
+  // sudah dikunci tidak diam-diam berubah tanpa proses buka-kunci eksplisit.
+  var isSetoranLocked = (branchId, date) => (S.get("setoranHarian") || []).some((s) => s.branchId === branchId && s.date === date && s.locked);
   var getHistoryModeDefault = () => ({ enabled: false, scope: "global", branchIds: [] });
   var getJadwalLiburDefault = () => ({});
   var normalizeJadwalLibur = (value) => {
@@ -991,7 +1280,12 @@ function useConfirm() {
         return;
       }
 
-      // ─── Validasi stok cukup (tidak ada toleransi minus - transaksi ditolak jika kurang) ───
+      // ─── Validasi ringan di client dulu — cuma supaya kasir cepat dapat
+      // feedback kalau memang jelas kurang. Keputusan FINAL yang aman dari
+      // race condition tetap ada di database lewat RPC di bawah (checklist #3.1):
+      // kalau di antara validasi ini dan RPC dijalankan ada transaksi lain
+      // yang lebih dulu menghabiskan stok, RPC akan menolak & transaksi ini
+      // dibatalkan — bukan menimpa/mengurangi dari angka stok yang sudah basi.
       const stoksNow = S.get("stokLapak") || [];
       for (const [menuId, pcs] of Object.entries(pcsKonsumsi)) {
         const cur = stoksNow.find((s) => s.branchId === branchId && s.menuId === menuId);
@@ -1003,19 +1297,40 @@ function useConfirm() {
         }
       }
 
-      const txs = S.get("transactions") || [];
-      S.set("transactions", [...txs, { id: uid(), branchId, date: safeTxDate, ts: tsForDate(safeTxDate), items: cart.map((x) => ({ ...x })), total: totalBayar, totalHPP: cart.reduce((a, x) => a + x.hpp * x.qty, 0) }]);
+      const txId = uid();
+      const itemsPayload = cart.map((x) => ({ ...x }));
+      const totalHPP = cart.reduce((a, x) => a + x.hpp * x.qty, 0);
 
-      // ─── Kurangi stokLapak ───
-      try {
-        for (const [menuId, pcs] of Object.entries(pcsKonsumsi)) {
-          const cur = stoksNow.find((s) => s.branchId === branchId && s.menuId === menuId);
-          const newStok = (cur?.stok || 0) - pcs;
-          await upsertStokLapak(branchId, menuId, newStok, cur);
+      // ─── Simpan transaksi + kurangi stok dalam SATU RPC atomik di database
+      // (menutup race condition lama — lihat migration_3_1_stok_atomik.sql) ───
+      const { error } = await sb.rpc("submit_transaksi_lapak", {
+        p_id: txId,
+        p_branch_id: branchId,
+        p_date: safeTxDate,
+        p_ts: tsForDate(safeTxDate),
+        p_items: itemsPayload,
+        p_total: totalBayar,
+        p_total_hpp: totalHPP,
+        p_pcs_konsumsi: pcsKonsumsi,
+      });
+
+      if (error) {
+        const m = /STOK_KURANG:(.+)/.exec(error.message || "");
+        if (m) {
+          try {
+            const info = JSON.parse(m[1]);
+            const menuNama = menus.find((mm) => mm.id === info.menuId)?.nama || info.menuId;
+            pushNotif(`Stok "${menuNama}" tinggal ${info.sisa} pcs saat transaksi diproses (kemungkinan baru saja terjual di kasir lain). Transaksi dibatalkan, cek ulang keranjang.`, "warning");
+          } catch {
+            pushNotif("Stok tidak cukup saat transaksi diproses. Transaksi dibatalkan, cek ulang keranjang.", "warning");
+          }
+        } else {
+          pushNotif("Gagal menyimpan transaksi: " + (error.message || String(error)), "warning");
         }
-        if (Object.keys(pcsKonsumsi).length > 0) await S.loadKey("stokLapak");
-      } catch (e) { pushNotif("Gagal update stok: " + (e?.message || String(e)), "warning"); }
+        return;
+      }
 
+      await Promise.all([S.loadKey("transactions"), S.loadKey("stokLapak")]);
       setCart([]);
       pushNotif("Transaksi disimpan!", "success");
       onSuccess?.();
@@ -1025,6 +1340,12 @@ function useConfirm() {
     const saveEdit = (txId, newItems, alasan) => {
       const txs = S.get("transactions") || [];
       const old = txs.find((x) => x.id === txId);
+      if (!old) { pushNotif("Transaksi tidak ditemukan.", "warning"); setEditModal(null); return; }
+      if (isSetoranLocked(old.branchId, old.date)) {
+        pushNotif("Setoran hari itu sudah dikunci. Buka kunci dulu di menu Setoran sebelum mengedit transaksi.", "warning");
+        setEditModal(null);
+        return;
+      }
       S.set("transactions", txs.map((t) => t.id === txId ? { ...t, items: newItems, total: newItems.reduce((a, x) => a + x.hargaJual * x.qty, 0), totalHPP: newItems.reduce((a, x) => a + x.hpp * x.qty, 0), edited: true } : t));
       const logs = S.get("editLog") || [];
       S.set("editLog", [...logs, { id: uid(), ts: tsForDate(safeTxDate), txId, branchId, branchName: curBranch?.name || branchId, alasan, before: old?.items || [], after: newItems }]);
@@ -1352,12 +1673,17 @@ function useConfirm() {
             React.createElement("div", { className: "tx-header" },
               React.createElement("span", { className: "tx-id" }, "STRUK-", tx.id.slice(0, 6).toUpperCase()),
               React.createElement("span", { className: "tx-ts" }, fmtTxTs(tx)),
-              tx.edited && React.createElement("span", { className: "badge-edit" }, "Diedit")
+              tx.edited && React.createElement("span", { className: "badge-edit" }, "Diedit"),
+              isSetoranLocked(tx.branchId, tx.date) && React.createElement("span", { className: "badge-ok" }, "🔒 Terkunci")
             ),
             tx.items.map((it, i) => React.createElement("div", { key: i, className: "tx-item" }, it.nama, " x", it.qty, " - ", fmtRp(it.hargaJual * it.qty))),
             React.createElement("div", { className: "tx-total" }, "Total: ", fmtRp(tx.total)),
-            // REVISI #2: tombol Edit hanya untuk owner
-            mode === "owner" && React.createElement("button", { className: "btn-edit-sm", onClick: () => setEditModal(tx) }, "Edit")
+            // REVISI #2: tombol Edit hanya untuk owner, dan cuma aktif kalau hari itu belum dikunci
+            mode === "owner" && (
+              isSetoranLocked(tx.branchId, tx.date)
+                ? React.createElement("span", { className: "info-txt", style: { fontSize: 11 } }, "Buka kunci setoran hari ini dulu untuk edit")
+                : React.createElement("button", { className: "btn-edit-sm", onClick: () => setEditModal(tx) }, "Edit")
+            )
           )
         )
       ),
@@ -1636,6 +1962,9 @@ function useConfirm() {
     const byDateArr = Object.entries(byDate).sort((a, b) => b[0].localeCompare(a[0]));
 
     const sudahDistrib = (prodId) => distribAll.some((d) => d.produksiId === prodId);
+    // Total pcs yang SUDAH dikirim untuk 1 produksi (bisa dari beberapa kali kirim bertahap).
+    const getTotalTerdistribusi = (prodId) => distribAll.filter((d) => d.produksiId === prodId).reduce((a, d) => a + (d.jumlahKirim || 0), 0);
+    const getSisaBelumDistribusi = (p) => Math.max((p.jumlah || 0) - getTotalTerdistribusi(p.id), 0);
     const getDistribForm = (prodId) => distribForm[prodId] || {};
     const setDistribEntry = (prodId, branchId, val) => setDistribForm((f) => ({ ...f, [prodId]: { ...(f[prodId] || {}), [branchId]: val } }));
 
@@ -1644,7 +1973,17 @@ function useConfirm() {
       const entries = branches.map((b) => ({ branchId: b.id, jumlah: parseInt(form[b.id] || "0") || 0 })).filter((e) => e.jumlah > 0);
       if (entries.length === 0) { pushNotif("Isi minimal 1 cabang dulu.", "warning"); return; }
       const totalKirim = entries.reduce((a, e) => a + e.jumlah, 0);
-      if (totalKirim > p.jumlah) { pushNotif("Total distribusi (" + totalKirim + ") melebihi jumlah produksi (" + p.jumlah + " pcs).", "warning"); return; }
+      // REVISI #1.3: validasi dihitung KUMULATIF terhadap distribusi yang SUDAH
+      // pernah dikirim untuk produksi ini sebelumnya (distribusi bertahap) —
+      // bukan cuma terhadap isian form saat ini. Sebelumnya bug ini bisa bikin
+      // over-alokasi di atas kertas kalau owner kirim distribusi 2x terpisah
+      // untuk produksi yang sama.
+      const sudahTerkirim = getTotalTerdistribusi(p.id);
+      const sisa = p.jumlah - sudahTerkirim;
+      if (totalKirim > sisa) {
+        pushNotif(`Total distribusi (${totalKirim}) melebihi sisa yang belum didistribusikan (${sisa} pcs — dari total produksi ${p.jumlah} pcs, sudah terkirim ${sudahTerkirim} pcs sebelumnya).`, "warning");
+        return;
+      }
       setDistribBusy((b) => ({ ...b, [p.id]: true }));
       try {
         const hppPerPcsDistrib = Math.ceil(p.hppPerPcs || getMenuHPPBreakdown(menus.find((m) => m.id === p.menuId))?.hppSatuanPerPcs || 0);
@@ -1748,13 +2087,17 @@ function useConfirm() {
                         React.createElement("button", { className: "btn-danger-sm", style: { marginLeft: 8 }, onClick: () => { if (!confirm("Hapus catatan ini?")) return; S.set("produksiCK", (S.get("produksiCK") || []).filter((x) => x.id !== p.id)); pushNotif("Dihapus.", "warning"); } }, "X")
                       )
                     ),
-                    sudahDistrib(p.id)
-                      ? React.createElement("div", { style: { marginTop: 6, padding: "6px 10px", background: "color-mix(in srgb, var(--green) 12%, var(--bg2))", borderRadius: 6, fontSize: 12, color: "var(--green)" } },
-                          "✅ Sudah didistribusikan — ",
-                          distribAll.filter((d) => d.produksiId === p.id).map((d) => d.branchName + ": " + d.jumlahKirim + " pcs").join(", ")
-                        )
+                    sudahDistrib(p.id) && React.createElement("div", { style: { marginTop: 6, padding: "6px 10px", background: "color-mix(in srgb, var(--green) 12%, var(--bg2))", borderRadius: 6, fontSize: 12, color: "var(--green)" } },
+                      "✅ Sudah didistribusikan — ",
+                      distribAll.filter((d) => d.produksiId === p.id).map((d) => d.branchName + ": " + d.jumlahKirim + " pcs").join(", ")
+                    ),
+                    getSisaBelumDistribusi(p) <= 0
+                      ? (sudahDistrib(p.id) && React.createElement("div", { style: { marginTop: 4, fontSize: 11, color: "var(--text2)" } }, "Seluruh hasil produksi ini sudah terdistribusi habis."))
                       : React.createElement("div", { style: { marginTop: 8, padding: "8px 10px", background: "var(--bg3)", borderRadius: 8, border: "1px solid var(--border)" } },
-                          React.createElement("div", { style: { fontSize: 12, color: "var(--accent)", fontWeight: 700, marginBottom: 6 } }, "🚚 Distribusi ke Cabang"),
+                          React.createElement("div", { style: { fontSize: 12, color: "var(--accent)", fontWeight: 700, marginBottom: 6 } },
+                            "🚚 ", sudahDistrib(p.id) ? "Lanjutkan Distribusi (Bertahap)" : "Distribusi ke Cabang",
+                            " — sisa ", getSisaBelumDistribusi(p), " pcs belum didistribusikan"
+                          ),
                           branches.length === 0 && React.createElement("p", { style: { fontSize: 12, color: "var(--text2)" } }, "Belum ada cabang lapak."),
                           branches.map((b) =>
                             React.createElement("div", { key: b.id, className: "row-wrap", style: { marginBottom: 4, gap: 8, alignItems: "center" } },
@@ -1765,8 +2108,8 @@ function useConfirm() {
                           ),
                           React.createElement("div", { style: { marginTop: 6, fontSize: 11, color: "var(--text2)" } },
                             "Total diisi: ",
-                            React.createElement("strong", { style: { color: Object.values(getDistribForm(p.id)).reduce((a, v) => a + (parseInt(v) || 0), 0) > p.jumlah ? "var(--red)" : "var(--green)" } },
-                              Object.values(getDistribForm(p.id)).reduce((a, v) => a + (parseInt(v) || 0), 0), " / ", p.jumlah, " pcs"
+                            React.createElement("strong", { style: { color: Object.values(getDistribForm(p.id)).reduce((a, v) => a + (parseInt(v) || 0), 0) > getSisaBelumDistribusi(p) ? "var(--red)" : "var(--green)" } },
+                              Object.values(getDistribForm(p.id)).reduce((a, v) => a + (parseInt(v) || 0), 0), " / ", getSisaBelumDistribusi(p), " pcs sisa"
                             )
                           ),
                           React.createElement("button", { className: "btn-primary btn-sm", style: { marginTop: 8 }, disabled: !!distribBusy[p.id], onClick: () => kirimDistribusi(p) }, distribBusy[p.id] ? "Mengirim..." : "🚚 Kirim Distribusi")
@@ -1827,79 +2170,77 @@ function useConfirm() {
     const [expandedBranch, setExpandedBranch] = useState(null);
     const [kpiDetail, setKpiDetail] = useState(null);
     const branches = S.get("branches") || [];
+    // branchesNonCK dipakai buat isi PILIHAN dropdown — sengaja daftar SEMUA
+    // cabang non-CK apa adanya, terlepas dari filter yang sedang aktif.
+    const branchesNonCK = branches.filter((b) => b.type !== "central_kitchen");
     const txs = S.get("transactions") || [];
     const pL = S.get("pengeluaranLapak") || [];
     const pO = S.get("pengeluaranOwner") || [];
     const profilesAll = S.get("profiles") || [];
     const investorsAll = S.get("investors") || [];
-    const fTxs = txs.filter((t) => t.date >= dr.from && t.date <= dr.to && (selBranch === "all" || t.branchId === selBranch));
-    const fPL = pL.filter((p) => p.date >= dr.from && p.date <= dr.to && (selBranch === "all" || p.branchId === selBranch));
-    const fPO = pO.filter((p) => p.date >= dr.from && p.date <= dr.to && (selBranch === "all" || !p.branchId || p.branchId === selBranch));
     const distribAll = S.get("distribusiCK") || [];
-    const fDistrib = distribAll.filter((d) => d.date >= dr.from && d.date <= dr.to && (selBranch === "all" || d.branchId === selBranch));
-    const omzet = fTxs.reduce((a, t) => a + t.total, 0);
-    const hppTerjual = fTxs.reduce((a, t) => a + t.totalHPP, 0);
-    const hppDistribusi = fDistrib.reduce((a, d) => a + (d.hppTotal || 0), 0);
-    const hppTidakLaku = Math.max(hppDistribusi - hppTerjual, 0);
     const stokTidakTerjualAll = S.get("stokTidakTerjual") || [];
-    const fStokTidakTerjual = stokTidakTerjualAll.filter((s) => s.date >= dr.from && s.date <= dr.to && (selBranch === "all" || s.branchId === selBranch));
-    const donatTidakTerjual = fStokTidakTerjual.reduce((a, s) => a + (s.qtyTidakTerjual || 0), 0);
-    const peng = fPL.reduce((a, p) => a + p.jumlah, 0) + fPO.reduce((a, p) => a + p.jumlah, 0);
-    const modal = hppDistribusi; // HPP yang dipakai untuk Laba Bersih = HPP seluruh barang yang didistribusikan
-    const laba = omzet - hppDistribusi - peng;
+    const menusAll = S.get("menuVarian") || [];
+
+    // ─── REVISI AUDIT: dulu di sini ada salinan rumus laba/rugi sendiri,
+    // terpisah dari hitungPerformaPeriode — persis pola yang pernah bikin
+    // bug "laba Dashboard vs TutupBuku beda sendiri". Sekarang Dashboard
+    // memanggil hitungPerformaPeriode yang SAMA dipakai PerformaPeriode &
+    // TutupBuku, jadi kalau rumusnya perlu berubah lagi cukup diubah SATU
+    // tempat. Dropdown "Semua Cabang Mandiri"/"Semua Cabang Investasi"
+    // dipetakan ke param {branchId, tipe} yang fungsi ini sudah pahami.
+    const scopeParams = selBranch === "__mandiri__" ? { branchId: "all", tipe: "mandiri" }
+      : selBranch === "__investasi__" ? { branchId: "all", tipe: "investasi" }
+      : { branchId: selBranch, tipe: "all" };
+    const hasil = hitungPerformaPeriode({
+      txs, pL, pO, distribAll, stokTidakTerjualAll, branches, investorsAll,
+      dateFrom: dr.from, dateTo: dr.to, ...scopeParams,
+    });
+    const { omzet, hppTidakLaku, donatTidakTerjual, peng, laba, ckSplit, nBranchForSplit, branchesInScope } = hasil;
+    const modal = hasil.hppDistribusi; // HPP yang dipakai untuk Laba Bersih = HPP seluruh barang yang didistribusikan
+    const fTxs = hasil.detail.transaksi;
+    const fPL = hasil.detail.pengeluaranLapak;
+    const fPO = hasil.detail.pengeluaranOwner;
+    const fDistrib = hasil.detail.distribusiCK;
+    const fStokTidakTerjual = hasil.detail.stokTidakTerjual;
+
     const danaPemList = S.get("danaPemeliharaan") || [];
     const saldoDanaPemeliharaan = danaPemList.reduce((a, d) => a + (d.tipe === "setor" ? d.jumlah : -d.jumlah), 0);
-    const menusAll = S.get("menuVarian") || [];
-    // Biaya global/pusat (pengeluaranOwner tanpa branchId) dibagi rata ke semua
-    // cabang lapak yang aktif — pembagi dihitung dari TOTAL cabang, bukan dari
-    // jumlah cabang yang sedang tampil, supaya filter 1-cabang tidak membuat
-    // cabang itu kelihatan menanggung 100% biaya global.
-    const nBranchForSplit = Math.max(branches.filter((b) => b.type !== "central_kitchen").length, 1);
-    const pOGlobal = fPO.filter((p) => !p.branchId);
-    const pOGlobalPerBranch = pOGlobal.reduce((a, p) => a + p.jumlah, 0) / nBranchForSplit;
-    const branchStats = branches
-      .filter((b) => b.type !== "central_kitchen")
-      .filter((b) => selBranch === "all" || b.id === selBranch)
-      .map((b) => {
-        const bTx = fTxs.filter((t) => t.branchId === b.id);
-        const bPLList = fPL.filter((p) => p.branchId === b.id);
-        const bPL = bPLList.reduce((a, p) => a + p.jumlah, 0);
-        const bPOList = fPO.filter((p) => p.branchId === b.id);
-        const bPOdirect = bPOList.reduce((a, p) => a + p.jumlah, 0);
-        const bPengOwner = bPOdirect + pOGlobalPerBranch;
-        const bPeng = bPL + bPengOwner;
-        const bO = bTx.reduce((a, t) => a + t.total, 0);
-        const bHppTerjual = bTx.reduce((a, t) => a + t.totalHPP, 0);
-        const bDistrib = fDistrib.filter((d) => d.branchId === b.id);
-        const bHppDistrib = bDistrib.reduce((a, d) => a + (d.hppTotal || 0), 0);
-        const bHppTidakLaku = Math.max(bHppDistrib - bHppTerjual, 0);
-        let boxTerjual = 0, pcsTerjual = 0;
-        bTx.forEach((t) => (t.items || []).forEach((it) => {
-          if (it.tipe === "toping") return;
-          const md = menusAll.find((m) => m.id === it.menuId);
-          if (md?.tipe === "paket") boxTerjual += it.qty; else pcsTerjual += it.qty;
-        }));
-        // Pekerja SUNGGUHAN yang akunnya terhubung ke cabang ini (dari tabel
-        // profiles) — menimpa field "workers" lama yang cuma teks manual di
-        // form Tambah Cabang dan bisa nyasar/telat sinkron dari akun asli.
-        const workerProfiles = profilesAll.filter((p) => p.role === "worker" && p.branchId === b.id);
-        return {
-          ...b, workers: workerProfiles, omzet: bO, modal: bHppDistrib, hppTerjual: bHppTerjual, hppTidakLaku: bHppTidakLaku,
-          peng: bPeng, pengLapak: bPL, pengLapakCount: bPLList.length,
-          pengOwner: bPengOwner, pengOwnerCount: bPOList.length, pengGlobalShare: pOGlobalPerBranch,
-          laba: bO - bHppDistrib - bPeng, txCount: bTx.length, distribCount: bDistrib.length, boxTerjual, pcsTerjual
-        };
-      });
+
+    // ─── Tambahan KHUSUS tampilan Dashboard (box/pcs terjual, daftar pekerja
+    // per cabang) — ditempel di atas branchStats yang sudah final dihitung
+    // hitungPerformaPeriode. Tidak ada angka uang (omzet/HPP/pengeluaran/laba)
+    // yang dihitung ulang di sini. ─────────────────────────────────────────
+    const branchStats = hasil.branchStats.map((b) => {
+      let boxTerjual = 0, pcsTerjual = 0;
+      fTxs.filter((t) => t.branchId === b.id).forEach((t) => (t.items || []).forEach((it) => {
+        if (it.tipe === "toping") return;
+        const md = menusAll.find((m) => m.id === it.menuId);
+        if (md?.tipe === "paket") boxTerjual += it.qty; else pcsTerjual += it.qty;
+      }));
+      // Pekerja SUNGGUHAN yang akunnya terhubung ke cabang ini (dari tabel
+      // profiles) — menimpa field "workers" lama yang cuma teks manual di
+      // form Tambah Cabang dan bisa nyasar/telat sinkron dari akun asli.
+      const workerProfiles = profilesAll.filter((p) => p.role === "worker" && p.branchId === b.id);
+      return { ...b, workers: workerProfiles, boxTerjual, pcsTerjual };
+    });
     const mc = {};
     fTxs.forEach((t) => t.items.forEach((it) => { mc[it.nama] = (mc[it.nama] || 0) + it.qty; }));
     const bs = Object.entries(mc).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    // Chart 7-hari cuma pakai cabang yang sedang match filter (bukan matchBranch
+    // lama — logic itu sekarang sudah pindah ke dalam hitungPerformaPeriode).
+    const scopeIds = new Set(branchesInScope.map((b) => b.id));
     const chart7 = [];
     for (let i = 6; i >= 0; i--) {
       const d = new Date(); d.setDate(d.getDate() - i);
       const ds = d.toISOString().slice(0, 10);
-      const dO = txs.filter((t) => t.date === ds).reduce((a, t) => a + t.total, 0);
-      const dP = pL.filter((p) => p.date === ds).reduce((a, p) => a + p.jumlah, 0) + pO.filter((p) => p.date === ds).reduce((a, p) => a + p.jumlah, 0);
-      const dM = txs.filter((t) => t.date === ds).reduce((a, t) => a + t.totalHPP, 0);
+      const dTxs = txs.filter((t) => t.date === ds && scopeIds.has(t.branchId));
+      const dO = dTxs.reduce((a, t) => a + t.total, 0);
+      const dM = dTxs.reduce((a, t) => a + t.totalHPP, 0);
+      const dPLangsung = pL.filter((p) => p.date === ds && scopeIds.has(p.branchId)).reduce((a, p) => a + p.jumlah, 0)
+        + pO.filter((p) => p.date === ds && p.branchId && scopeIds.has(p.branchId)).reduce((a, p) => a + p.jumlah, 0);
+      const dPGlobalTotal = pO.filter((p) => p.date === ds && !p.branchId).reduce((a, p) => a + p.jumlah, 0);
+      const dP = dPLangsung + dPGlobalTotal * (branchesInScope.length / nBranchForSplit);
       chart7.push({ label: ds.slice(5), v1: dO, v2: dM + dP });
     }
     const branchChart = branchStats.map((b) => ({ label: b.name.slice(0, 8), v1: b.omzet, v2: b.laba }));
@@ -1940,18 +2281,35 @@ function useConfirm() {
       },
       peng: {
         title: "Rincian Pengeluaran", total: peng, totalLabel: "Total Pengeluaran",
-        note: "Setiap entri pengeluaran lapak & owner pada periode ini (owner sudah difilter sesuai cabang terpilih).",
+        note: (branchesInScope.length > 1
+          ? "Setiap entri pengeluaran lapak & owner pada periode ini."
+          : "Setiap entri pengeluaran lapak & owner pada periode ini. Biaya global/pusat (tanpa cabang) ditampilkan sebagai porsi bagi rata cabang ini, sama seperti di panel Performa Cabang.")
+          + " Gaji Central Kitchen ditampilkan terpisah, dibagi proporsional ke pcs distribusi yang diterima tiap cabang (bukan bagi rata).",
         rows: [
           ...fPL.map((p) => ({ label: "[Lapak] " + p.keterangan, sub: formatTanggalIndoPendek(p.date) + " • " + (p.branchName || bName(p.branchId)), value: p.jumlah, ts: p.ts, date: p.date })),
-          ...fPO.map((p) => ({ label: "[Owner] " + p.keterangan, sub: formatTanggalIndoPendek(p.date) + " • " + (p.branchName || bName(p.branchId)) + (p.kategori ? " • " + (KATEGORI_LABEL[p.kategori] || p.kategori) : ""), value: p.jumlah, ts: p.ts, date: p.date }))
+          ...fPO.filter((p) => !(p.branchId && ckSplit.ckBranchIds.has(p.branchId))).map((p) => {
+            const isGlobalShare = selBranch !== "all" && !p.branchId;
+            const shareRatio = branchesInScope.length / nBranchForSplit;
+            const value = isGlobalShare ? p.jumlah * shareRatio : p.jumlah;
+            return {
+              label: "[Owner] " + p.keterangan,
+              sub: formatTanggalIndoPendek(p.date) + " • " + (p.branchName || bName(p.branchId)) + (p.kategori ? " • " + (KATEGORI_LABEL[p.kategori] || p.kategori) : "") + (isGlobalShare ? " • porsi " + branchesInScope.length + "/" + nBranchForSplit + " biaya global" : ""),
+              value, ts: p.ts, date: p.date
+            };
+          }),
+          ...branchesInScope.filter((b) => (ckSplit.perBranch[b.id] || 0) > 0).map((b) => ({
+            label: "[CK] Gaji Central Kitchen — porsi " + b.name,
+            sub: "Dibagi proporsional ke pcs distribusi yang diterima cabang ini pada periode ini",
+            value: ckSplit.perBranch[b.id] || 0, ts: dr.to, date: dr.to
+          }))
         ].sort(byTsDesc)
       },
       laba: {
         title: "Rincian Laba Bersih", total: laba, totalLabel: "Laba Bersih",
-        note: "Laba = Omzet − HPP Bahan − Pengeluaran Lapak − Pengeluaran Owner (termasuk bagian rata biaya global/pusat seperti gaji & sewa yang tidak diikat ke satu cabang).",
+        note: "Laba = Omzet − HPP Bahan − Pengeluaran Lapak − Pengeluaran Owner (termasuk bagian rata biaya global/pusat, dan bagian proporsional gaji Central Kitchen berdasar pcs distribusi yang diterima).",
         rows: branchStats.map((b) => ({
           label: b.name,
-          sub: "Omzet " + fmtRp(b.omzet) + " (" + b.txCount + "x transaksi) − HPP " + fmtRp(b.modal) + " (" + b.distribCount + "x distribusi) − Peng Lapak " + fmtRp(b.pengLapak) + " (" + b.pengLapakCount + " entri) − Peng Owner " + fmtRp(b.pengOwner) + " (" + b.pengOwnerCount + " entri" + (b.pengGlobalShare > 0 ? " + bagi rata global " + fmtRp(b.pengGlobalShare) : "") + ")",
+          sub: "Omzet " + fmtRp(b.omzet) + " (" + b.txCount + "x transaksi) − HPP " + fmtRp(b.modal) + " (" + b.distribCount + "x distribusi) − Peng Lapak " + fmtRp(b.pengLapak) + " (" + b.pengLapakCount + " entri) − Peng Owner " + fmtRp(b.pengOwner) + " (" + b.pengOwnerCount + " entri" + (b.pengGlobalShare > 0 ? " + bagi rata global " + fmtRp(b.pengGlobalShare) : "") + (b.pengGajiCk > 0 ? " + porsi gaji CK " + fmtRp(b.pengGajiCk) : "") + ")",
           value: b.laba
         }))
       },
@@ -1995,7 +2353,9 @@ function useConfirm() {
         React.createElement(DateField, { value: dr.to, onChange: (e) => setDr((r) => ({ ...r, to: e.target.value })) }),
         React.createElement("select", { className: "inp inp-sm", value: selBranch, onChange: (e) => setSelBranch(e.target.value) },
           React.createElement("option", { value: "all" }, "Semua Cabang"),
-          branches.filter((b) => b.type !== "central_kitchen").map((b) => React.createElement("option", { key: b.id, value: b.id }, b.name))
+          React.createElement("option", { value: "__mandiri__" }, "Semua Cabang Mandiri"),
+          React.createElement("option", { value: "__investasi__" }, "Semua Cabang Investasi"),
+          branchesNonCK.map((b) => React.createElement("option", { key: b.id, value: b.id }, b.name))
         )
       ),
       React.createElement("div", { className: "kpi-grid" },
@@ -2236,6 +2596,7 @@ function useConfirm() {
     const [bulan, setBulan] = useState(today().slice(0, 7));
     const branches = S.get("branches") || [];
     const investors = S.get("investors") || [];
+    const [confirmAsk, confirmModal] = useConfirm();
     const refresh = () => { setSH(S.get("setoranHarian") || []); setSB(S.get("setoranBulanan") || []); };
 
     const konfirmasi = (id) => {
@@ -2255,19 +2616,54 @@ function useConfirm() {
       refresh(); pushNotif("Setoran dikunci kembali.", "success");
     };
 
+    // Hapus permanen — sengaja TIDAK lewat S.set (yang menghapus dari tampilan
+    // duluan sebelum tahu hasil sebenarnya). Di sini delete ke Supabase dulu,
+    // baru percaya tampilan kalau baris yang kehapus di database memang > 0 —
+    // supaya tidak ada kejadian "kelihatan terhapus" tapi sebenarnya masih ada
+    // (misalnya kalau ternyata masih locked=true dan ditolak RLS diam-diam).
+    const hapusSetoranHarian = async (id) => {
+      try {
+        const { data, error } = await sb.from("setoranHarian").delete().eq("id", id).select();
+        if (error) throw error;
+        if (!data || data.length === 0) {
+          pushNotif("Tidak ada yang terhapus — kemungkinan data ini masih terkunci di database. Muat ulang halaman lalu coba lagi.", "warning");
+          return;
+        }
+        await S.loadKey("setoranHarian");
+        refresh();
+        pushNotif("Setoran berhasil dihapus permanen.", "success");
+      } catch (e) {
+        pushNotif(e?.message || String(e), "warning");
+      }
+    };
+
+    const askHapusSetoran = (s) => confirmAsk({
+      title: "Hapus Setoran",
+      message: `Yakin hapus setoran ${s.branchName || branches.find((x) => x.id === s.branchId)?.name || s.branchId} tanggal ${formatTanggalIndoPendek(s.date)} secara permanen? Data yang sudah dihapus tidak bisa dikembalikan.`,
+      onConfirm: () => hapusSetoranHarian(s.id)
+    });
+
     const kirimBulanan = (branchId, investorId) => {
       const txs = S.get("transactions") || [];
       const mTxs = txs.filter((t) => t.branchId === branchId && t.date.startsWith(bulan));
       const omzet = mTxs.reduce((a, t) => a + t.total, 0);
-      const mDistrib = (S.get("distribusiCK") || []).filter((d) => d.branchId === branchId && d.date.startsWith(bulan));
+      const distribBulanIni = (S.get("distribusiCK") || []).filter((d) => d.date.startsWith(bulan));
+      const mDistrib = distribBulanIni.filter((d) => d.branchId === branchId);
       const modal = mDistrib.reduce((a, d) => a + (d.hppTotal || 0), 0);
       const pLapak = (S.get("pengeluaranLapak") || []).filter((p) => p.branchId === branchId && p.date.startsWith(bulan)).reduce((a, p) => a + p.jumlah, 0);
       const allPO = S.get("pengeluaranOwner") || [];
-      const nBranch = Math.max((S.get("branches") || []).filter((b) => b.type !== "central_kitchen").length, 1);
+      const allBranchesForSplit = S.get("branches") || [];
+      const nBranch = Math.max(allBranchesForSplit.filter((b) => b.type !== "central_kitchen").length, 1);
+      const poBulanIni = allPO.filter((p) => p.date.startsWith(bulan));
       // REVISI #4: gabungkan biaya langsung ke cabang + bagian global
-      const directPO = allPO.filter((p) => p.branchId === branchId && p.date.startsWith(bulan)).reduce((a, p) => a + p.jumlah, 0);
-      const globalPO = allPO.filter((p) => !p.branchId && p.date.startsWith(bulan)).reduce((a, p) => a + p.jumlah, 0) / nBranch;
-      const pOwner = directPO + globalPO;
+      const directPO = poBulanIni.filter((p) => p.branchId === branchId).reduce((a, p) => a + p.jumlah, 0);
+      const globalPO = poBulanIni.filter((p) => !p.branchId).reduce((a, p) => a + p.jumlah, 0) / nBranch;
+      // Gaji Central Kitchen dibagi PROPORSIONAL ke pcs distribusi yang diterima
+      // tiap cabang bulan ini — supaya laporan bulanan (dasar bagi hasil
+      // investor) tidak lagi menghitung laba tanpa potongan biaya tenaga CK.
+      const ckSplit = hitungBiayaCkPerCabang({ po: poBulanIni, distribAll: distribBulanIni, branches: allBranchesForSplit });
+      const ckPO = ckSplit.perBranch[branchId] || 0;
+      const pOwner = directPO + globalPO + ckPO;
       const laba = omzet - modal - pLapak - pOwner;
       const inv = investors.find((i) => i.id === investorId);
       const bagian = laba * ((inv?.persenBagi || 0) / 100);
@@ -2316,7 +2712,10 @@ function useConfirm() {
                 React.createElement("span", { className: "badge-ok" }, s.locked ? "🔒 " : "🔓 ", "Dikonfirmasi - ", s.konfirmasiTs),
                 s.locked
                   ? React.createElement("button", { className: "btn-secondary btn-sm", onClick: () => bukaKunciSetoran(s.id) }, "Buka Kunci")
-                  : React.createElement("button", { className: "btn-secondary btn-sm", onClick: () => kunciUlangSetoran(s.id) }, "Kunci Lagi")
+                  : React.createElement(React.Fragment, null,
+                      React.createElement("button", { className: "btn-secondary btn-sm", onClick: () => kunciUlangSetoran(s.id) }, "Kunci Lagi"),
+                      React.createElement("button", { className: "btn-danger-sm", style: { marginLeft: 6 }, onClick: () => askHapusSetoran(s) }, "Hapus")
+                    )
               )
             )
           );
@@ -2348,7 +2747,8 @@ function useConfirm() {
             )
           );
         })
-      )
+      ),
+      confirmModal
     );
   }
 
@@ -2371,13 +2771,27 @@ function useConfirm() {
     const hppTerjualRpt = txsAll.reduce((a, t) => a + t.totalHPP, 0);
     const modal = distribAllRpt.reduce((a, d) => a + (d.hppTotal || 0), 0);
     const hppTidakLakuRpt = Math.max(modal - hppTerjualRpt, 0);
+    // Gaji Central Kitchen dibagi PROPORSIONAL ke pcs distribusi yang diterima
+    // tiap cabang hari ini — dihitung dari po/distribusi hari ini TANPA filter
+    // cabang dulu (poCkRpt/distribCkRpt), supaya proporsinya benar walau
+    // laporan sedang difilter ke 1 cabang saja.
+    const poCkRpt = (S.get("pengeluaranOwner") || []).filter((p) => p.date === date);
+    const distribCkRpt = (S.get("distribusiCK") || []).filter((d) => d.date === date);
+    const ckSplitRpt = hitungBiayaCkPerCabang({ po: poCkRpt, distribAll: distribCkRpt, branches });
+    const pOExclCk = pO.filter((p) => !(p.branchId && ckSplitRpt.ckBranchIds.has(p.branchId)));
     const tPL = pL.reduce((a, p) => a + p.jumlah, 0);
-    const tPO = pO.reduce((a, p) => a + p.jumlah, 0);
+    const tPO = pOExclCk.reduce((a, p) => a + p.jumlah, 0) + (selBranch === "all" ? ckSplitRpt.totalCk : (ckSplitRpt.perBranch[selBranch] || 0));
     const laba = omzet - modal - tPL - tPO;
 
     const saveEdit = (txId, newItems, alasan) => {
       const txs = S.get("transactions") || [];
       const old = txs.find((x) => x.id === txId);
+      if (!old) { pushNotif?.("Transaksi tidak ditemukan.", "warning"); setEditModal(null); return; }
+      if (isSetoranLocked(old.branchId, old.date)) {
+        pushNotif?.("Setoran hari itu sudah dikunci. Buka kunci dulu di menu Setoran sebelum mengedit transaksi.", "warning");
+        setEditModal(null);
+        return;
+      }
       const branchId = old?.branchId;
       const branchName = branches.find((b) => b.id === branchId)?.name || branchId;
       S.set("transactions", txs.map((t) => t.id === txId ? { ...t, items: newItems, total: newItems.reduce((a, x) => a + x.hargaJual * x.qty, 0), totalHPP: newItems.reduce((a, x) => a + x.hpp * x.qty, 0), edited: true } : t));
@@ -2400,7 +2814,7 @@ function useConfirm() {
         const bPL = pL.filter((p) => p.branchId === b.id).reduce((a, p) => a + p.jumlah, 0);
         const bPODirect = pO.filter((p) => p.branchId === b.id).reduce((a, p) => a + p.jumlah, 0);
         const bPOGlobal = pOGlobalTotal / nBranchAll;
-        const bPO = bPODirect + bPOGlobal;
+        const bPO = bPODirect + bPOGlobal + (ckSplitRpt.perBranch[b.id] || 0);
         const bO = bTxs.reduce((a, t) => a + t.total, 0);
         const bHppTerjual = bTxs.reduce((a, t) => a + t.totalHPP, 0);
         const bM = distribAllRpt.filter((d) => d.branchId === b.id).reduce((a, d) => a + (d.hppTotal || 0), 0);
@@ -2464,12 +2878,17 @@ function useConfirm() {
                 React.createElement("div", { className: "tx-header" },
                   React.createElement("span", { className: "tx-id" }, "STRUK-", tx.id.slice(0, 6).toUpperCase()),
                   React.createElement("span", { className: "tx-ts" }, fmtTxTs(tx)),
-                  tx.edited && React.createElement("span", { className: "badge-warn" }, "Diedit")
+                  tx.edited && React.createElement("span", { className: "badge-warn" }, "Diedit"),
+                  isSetoranLocked(tx.branchId, tx.date) && React.createElement("span", { className: "badge-ok" }, "🔒 Terkunci")
                 ),
                 tx.items.map((it, i) => React.createElement("div", { key: i, className: "tx-item" }, it.nama, " x", it.qty, " = ", fmtRp(it.hargaJual * it.qty), " (HPP: ", fmtRp(it.hpp * it.qty), ")")),
                 React.createElement("div", { className: "tx-total" }, "Omzet: ", fmtRp(tx.total), " | HPP: ", fmtRp(tx.totalHPP), " | Laba: ", fmtRp(tx.total - tx.totalHPP)),
-                // Tombol Edit ada di sini (OwnerLaporan)
-                React.createElement("button", { className: "btn-edit-sm mt4", onClick: () => setEditModal(tx) }, "Edit Transaksi")
+                // Tombol Edit ada di sini (OwnerLaporan) - dikunci kalau setoran hari itu
+                // sudah dikonfirmasi, supaya laporan yang sudah dikunci tidak diam-diam
+                // berubah tanpa buka-kunci eksplisit dulu di menu Setoran.
+                isSetoranLocked(tx.branchId, tx.date)
+                  ? React.createElement("span", { className: "info-txt mt4", style: { fontSize: 11 } }, "Terkunci — buka kunci di menu Setoran Harian untuk edit")
+                  : React.createElement("button", { className: "btn-edit-sm mt4", onClick: () => setEditModal(tx) }, "Edit Transaksi")
               )
             ),
             // Pengeluaran lapak cabang ini
@@ -2609,6 +3028,8 @@ function useConfirm() {
     const [month, setMonth] = useState(today().slice(0, 7));
     const [selBranch, setSelBranch] = useState("all");
     const [busyGaji, setBusyGaji] = useState({});
+    const [busyHapusAbs, setBusyHapusAbs] = useState({});
+    const [confirmAsk, confirmModal] = useConfirm();
     const branches = S.get("branches") || [];
     const profiles = (S.get("profiles") || []).filter(isActiveProfile);
     const absensi = S.get("absensi") || [];
@@ -2702,6 +3123,57 @@ function useConfirm() {
       finally { setBusyGaji((b) => { const c = { ...b }; delete c[userId]; return c; }); }
     };
 
+    // Hapus 1 catatan absensi (misal: salah check-in di hari yang seharusnya
+    // libur). Sengaja per-baris, BUKAN lewat "Bersihkan Data" yang hapus 1
+    // cabang+1 hari PENUH (semua pekerja) — supaya koreksi 1 orang tidak
+    // menyeret absensi pekerja lain yang benar. Verifikasi ke database dulu
+    // (bukan optimis) seperti pola hapusSetoranHarian, dan otomatis membatalkan
+    // gaji harian otomatis yang ikut ter-generate dari check-in ini supaya
+    // tidak ada pengeluaran "hantu" yang nyangkut walau absensinya sudah hilang.
+    const hapusAbsensi = async (row, worker) => {
+      const bulanRow = String(row.date || "").slice(0, 7);
+      const monthLocked = snaps.some((s) => s.user_id === worker.user_id && s.bulan === bulanRow && s.locked);
+      if (monthLocked) {
+        pushNotif("Rekap bulan ini sudah dikunci. Klik \"Buka Kunci\" dulu sebelum menghapus absensi.", "warning");
+        return;
+      }
+      setBusyHapusAbs((b) => ({ ...b, [row.id]: true }));
+      try {
+        const { data, error } = await sb.from("absensi").delete().eq("id", row.id).select();
+        if (error) throw error;
+        if (!data || data.length === 0) {
+          pushNotif("Tidak ada yang terhapus — kemungkinan data ini masih terkunci di database. Muat ulang halaman lalu coba lagi.", "warning");
+          return;
+        }
+        await S.loadKey("absensi");
+
+        // Batalkan gaji harian otomatis (kalau ada) yang ikut ter-generate saat check-in ini.
+        const pOwnerAll = S.get("pengeluaranOwner") || [];
+        const gajiOtomatis = pOwnerAll.find((p) => p.autoGajiUserId === worker.user_id && p.date === row.date);
+        if (gajiOtomatis) {
+          const { error: delGajiErr } = await sb.from("pengeluaranOwner").delete().eq("id", gajiOtomatis.id);
+          if (!delGajiErr) await S.loadKey("pengeluaranOwner");
+        }
+
+        pushNotif(
+          "Absensi tanggal " + formatTanggalIndoPendek(row.date) + " berhasil dihapus" +
+          (gajiOtomatis ? ", gaji harian otomatis untuk hari itu juga ikut dibatalkan." : "."),
+          "success"
+        );
+      } catch (e) {
+        pushNotif(e?.message || String(e), "warning");
+      } finally {
+        setBusyHapusAbs((b) => { const c = { ...b }; delete c[row.id]; return c; });
+      }
+    };
+
+    const askHapusAbsensi = (row, worker) => confirmAsk({
+      title: "Hapus Absensi",
+      message: `Yakin hapus catatan absensi ${worker.display_name || worker.displayName || worker.email || "pekerja ini"} tanggal ${formatTanggalIndoPendek(row.date)}? Check-in${row.checkout_ts ? "/check-out" : ""} hari itu akan dihapus PERMANEN dan tidak bisa dikembalikan. Gaji harian otomatis untuk hari itu (kalau ada) akan ikut dibatalkan.`,
+      confirmLabel: "Ya, Hapus",
+      onConfirm: () => hapusAbsensi(row, worker)
+    });
+
     const totalHadir = rows.reduce((a, r) => a + (r.hadir || 0), 0);
     const totalMenit = rows.reduce((a, r) => a + (r.menit || 0), 0);
     const hadirHariIniCount = rows.filter((r) => r.hadirHariIni).length;
@@ -2768,12 +3240,20 @@ function useConfirm() {
             ? React.createElement("div", { style: { fontSize: 12, color: "var(--text2)", marginBottom: 8 } }, "Belum ada riwayat absen bulan ini.")
             : React.createElement("div", { style: { marginBottom: 8 } },
                 r.history.map((h) =>
-                  React.createElement("div", { key: h.id, style: { display: "flex", justifyContent: "space-between", fontSize: 12, padding: "3px 0", borderBottom: "1px solid color-mix(in srgb, var(--border) 50%, transparent)" } },
+                  React.createElement("div", { key: h.id, style: { display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12, padding: "3px 0", borderBottom: "1px solid color-mix(in srgb, var(--border) 50%, transparent)", gap: 8 } },
                     React.createElement("span", { style: { color: "var(--text)", fontWeight: 500 } }, formatTanggalIndoPendek(h.date)),
                     React.createElement("span", { style: { color: "var(--text2)" } },
                       "Masuk ", React.createElement("strong", null, getJam(h.checkin_ts)),
                       " — Keluar ", React.createElement("strong", { style: { color: h.checkout_ts ? "var(--green)" : "var(--yellow)" } }, h.checkout_ts ? getJam(h.checkout_ts) : "Belum")
-                    )
+                    ),
+                    r.locked
+                      ? React.createElement("span", { style: { fontSize: 10, color: "var(--yellow)" } }, "🔒")
+                      : React.createElement("button", {
+                          className: "btn-danger-sm",
+                          disabled: !!busyHapusAbs[h.id],
+                          title: "Hapus catatan absensi ini",
+                          onClick: () => askHapusAbsensi(h, r.w)
+                        }, busyHapusAbs[h.id] ? "..." : "🗑️")
                   )
                 )
               ),
@@ -2792,7 +3272,8 @@ function useConfirm() {
                 }, busyGaji[userId] ? "Mengirim..." : "💸 Bayarkan Gaji " + fmtRp(gajiInfo.total))
             : null
         );
-      })
+      }),
+      confirmModal
     );
   }
 
@@ -3964,6 +4445,817 @@ function SettingAkun({ pushNotif }) {
     );
   }
 
+  // ─── TutupBuku ───────────────────────────────────────────────────────────
+  function TutupBuku({ pushNotif }) {
+    const [confirmAsk, confirmModal] = useConfirm();
+    const [bulan, setBulan] = useState(() => new Date().toISOString().slice(0, 7)); // "YYYY-MM"
+    const [busy, setBusy] = useState(false);
+    const [checklist, setChecklist] = useState(null);
+    const [current, setCurrent] = useState(null); // baris tutupBuku is_current untuk bulan ini, kalau ada
+    const [loadingCurrent, setLoadingCurrent] = useState(false);
+
+    const branches = S.get("branches") || [];
+
+    // ─── Ambil status penutupan bulan yang sedang dipilih ───────────────────
+    const loadCurrent = useCallback(async () => {
+      setLoadingCurrent(true);
+      try {
+        const { data, error } = await sb
+          .from("tutupBuku")
+          .select("*")
+          .eq("bulan", bulan)
+          .eq("is_current", true)
+          .maybeSingle();
+        if (error) throw error;
+        setCurrent(data || null);
+      } catch (e) {
+        pushNotif("Gagal cek status tutup buku: " + (e?.message || e), "warning");
+      } finally {
+        setLoadingCurrent(false);
+      }
+    }, [bulan]);
+
+    useEffect(() => { loadCurrent(); setChecklist(null); }, [loadCurrent]);
+
+    // ─── Checklist validasi sebelum boleh tutup buku ────────────────────────
+    const runChecklist = async () => {
+      setBusy(true);
+      try {
+        const warnings = [];
+
+        const { data: setoran, error: e1 } = await sb
+          .from("setoranHarian")
+          .select("branchId, date, status")
+          .gte("date", bulan + "-01")
+          .lt("date", nextMonthStr(bulan));
+        if (e1) throw e1;
+
+        const belumSelesai = (setoran || []).filter((s) => s.status !== "selesai");
+        if (belumSelesai.length > 0) {
+          warnings.push(`${belumSelesai.length} Setoran Harian bulan ini belum dikonfirmasi (status masih "menunggu").`);
+        }
+
+        const { data: distrib, error: e2 } = await sb
+          .from("distribusiCK")
+          .select("id, status")
+          .gte("date", bulan + "-01")
+          .lt("date", nextMonthStr(bulan))
+          .eq("status", "pending");
+        if (e2) throw e2;
+        if ((distrib || []).length > 0) {
+          warnings.push(`${distrib.length} Distribusi CK bulan ini masih berstatus "Pending".`);
+        }
+
+        const { data: gaji, error: e3 } = await sb
+          .from("gajiPembayaran")
+          .select("id, status")
+          .eq("bulan", bulan)
+          .neq("status", "dikonfirmasi");
+        if (e3) throw e3;
+        if ((gaji || []).length > 0) {
+          warnings.push(`${gaji.length} pembayaran gaji bulan ini belum berstatus "Dikonfirmasi".`);
+        }
+
+        setChecklist({ warnings, checkedAt: nowTs() });
+        return warnings;
+      } catch (e) {
+        pushNotif("Gagal jalankan checklist: " + (e?.message || e), "warning");
+        return null;
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    // ─── Hitung snapshot angka final bulan ini ──────────────────────────────
+    const hitungSnapshot = async () => {
+      const from = bulan + "-01";
+      const to = nextMonthStr(bulan);
+
+      const [txRes, plRes, poRes, distRes, gajiRes] = await Promise.all([
+        sb.from("transactions").select("branchId, total, totalHPP, items, date").gte("date", from).lt("date", to),
+        sb.from("pengeluaranLapak").select("branchId, jumlah, keterangan, date").gte("date", from).lt("date", to),
+        sb.from("pengeluaranOwner").select("branchId, jumlah, keterangan, kategori, date").gte("date", from).lt("date", to),
+        sb.from("distribusiCK").select("branchId, hppTotal, jumlahKirim, date").gte("date", from).lt("date", to),
+        sb.from("gajiPembayaran").select("branchId, jumlah, bulan").eq("bulan", bulan),
+      ]);
+      for (const r of [txRes, plRes, poRes, distRes, gajiRes]) if (r.error) throw r.error;
+
+      const txs = txRes.data || [];
+      const pl = plRes.data || [];
+      const po = poRes.data || [];
+      const dist = distRes.data || [];
+      const gaji = gajiRes.data || [];
+      const gajiTotal = gaji.reduce((a, g) => a + (g.jumlah || 0), 0); // info status bayar saja, bukan komponen laba
+
+      const investorsAll = S.get("investors") || [];
+
+      // ─── REVISI AUDIT: laba/rugi bulan ini dulu dihitung ulang manual di
+      // sini (salinan ke-3 dari rumus yang sama persis dengan OwnerDashboard
+      // & PerformaPeriode) — sekarang panggil hitungPerformaPeriode yang
+      // SAMA, supaya cuma ada SATU rumus laba di seluruh app. Data tetap
+      // diambil FRESH dari server di atas (bukan cache client S), supaya
+      // snapshot yang bakal dikunci ini akurat per saat ditutup — cuma cara
+      // MENGHITUNGnya yang sekarang dipusatkan.
+      const hasil = hitungPerformaPeriode({
+        txs, pL: pl, pO: po, distribAll: dist, stokTidakTerjualAll: [], branches, investorsAll,
+        dateFrom: from, dateTo: to, branchId: "all", tipe: "all",
+      });
+
+      // ─── Petakan ke skema kolom "tutupBuku" yang SUDAH ADA — nama field
+      // sengaja dipertahankan persis seperti sebelumnya, supaya
+      // TutupBukuTahunan (yang membaca detail.perCabang) dan export Excel
+      // yang sudah bergantung ke nama-nama ini tidak ikut berubah. ────────
+      const perCabang = hasil.branchStats.map((b) => ({
+        branchId: b.id,
+        nama: b.name,
+        tipe: b.type === "investasi" ? "investasi" : "mandiri",
+        investorId: b.investorId,
+        investorNama: b.investorNama,
+        omzet: b.omzet,
+        hpp: b.modal,
+        hppTerjual: b.hppTerjual,
+        hppTidakLaku: b.hppTidakLaku,
+        pengeluaranLapak: b.pengLapak,
+        pengeluaranOwner: b.pengOwner,
+        pengeluaranGajiCk: b.pengGajiCk,
+        laba: b.laba,
+        txCount: b.txCount,
+      }));
+
+      // ─── Pisah total mandiri vs investasi — JANGAN digabung jadi satu angka.
+      // Owner butuh tahu berapa laba dari cabang MILIKNYA SENDIRI, terpisah dari
+      // bagian yang secara bisnis "milik"/harus dibagi ke investor.
+      const sumTipe = (tipe) => {
+        const rows = perCabang.filter((b) => b.tipe === tipe);
+        return {
+          omzet: rows.reduce((a, b) => a + b.omzet, 0),
+          hpp: rows.reduce((a, b) => a + b.hpp, 0),
+          pengeluaran: rows.reduce((a, b) => a + b.pengeluaranLapak + b.pengeluaranOwner, 0),
+          laba: rows.reduce((a, b) => a + b.laba, 0),
+          txCount: rows.reduce((a, b) => a + b.txCount, 0),
+        };
+      };
+      const totalMandiri = sumTipe("mandiri");
+      const totalInvestasi = sumTipe("investasi");
+
+      // Per investor (kalau owner punya lebih dari 1 investor, jangan campur juga)
+      const perInvestor = investorsAll.map((inv) => {
+        const rows = perCabang.filter((b) => b.tipe === "investasi" && b.investorId === inv.id);
+        return {
+          investorId: inv.id,
+          investorNama: inv.nama,
+          cabang: rows.map((r) => r.nama),
+          omzet: rows.reduce((a, b) => a + b.omzet, 0),
+          hpp: rows.reduce((a, b) => a + b.hpp, 0),
+          pengeluaran: rows.reduce((a, b) => a + b.pengeluaranLapak + b.pengeluaranOwner, 0),
+          laba: rows.reduce((a, b) => a + b.laba, 0),
+        };
+      }).filter((i) => i.cabang.length > 0);
+
+      return {
+        omzet: hasil.omzet, hpp: hasil.hppDistribusi, hppTerjual: hasil.hppTerjual, hppTidakLaku: hasil.hppTidakLaku,
+        // Dijumlahkan dari perCabang (partisi persis dari pl/po mentah di atas,
+        // lihat catatan di hitungPerformaPeriode) — bukan hitung ulang terpisah.
+        pengeluaranLapak: perCabang.reduce((a, b) => a + b.pengeluaranLapak, 0),
+        pengeluaranOwner: perCabang.reduce((a, b) => a + b.pengeluaranOwner, 0),
+        gajiTotal, labaBersih: hasil.laba,
+        txCount: txs.length,
+        totalMandiri, totalInvestasi,
+        detail: {
+          perCabang,
+          perInvestor,
+          // FIX: totalMandiri/totalInvestasi dulu dihitung tapi cuma ditaruh di
+          // level atas snap (di luar detail) — sedangkan yang disimpan ke kolom
+          // "detail" tabel tutupBuku cuma object ini. Efeknya, breakdown "Laba
+          // Cabang Mandiri/Investasi" di bawah CACAT untuk SEMUA bulan yang
+          // sudah ditutup sebelumnya (current.detail.totalMandiri selalu
+          // undefined). Sekarang diikutkan ke sini juga supaya benar-benar
+          // tersimpan. Dipakai juga oleh agregasi TutupBukuTahunan di bawah.
+          totalMandiri,
+          totalInvestasi,
+          transaksi: txs,
+          pengeluaranLapak: pl,
+          pengeluaranOwner: po,
+          distribusiCK: dist,
+          gajiPembayaran: gaji,
+        },
+      };
+    };
+
+    // ─── Kunci semua data bulan ini di database ─────────────────────────────
+    const kunciDataBulan = async () => {
+      const from = bulan + "-01";
+      const to = nextMonthStr(bulan);
+      const r1 = await sb.from("setoranHarian").update({ locked: true }).gte("date", from).lt("date", to);
+      if (r1.error) throw r1.error;
+      const r2 = await sb.from("absensiBulanan").update({ locked: true }).eq("bulan", bulan);
+      if (r2.error) throw r2.error;
+    };
+
+    const bukaKunciDataBulan = async () => {
+      const from = bulan + "-01";
+      const to = nextMonthStr(bulan);
+      const r1 = await sb.from("setoranHarian").update({ locked: false }).gte("date", from).lt("date", to);
+      if (r1.error) throw r1.error;
+      const r2 = await sb.from("absensiBulanan").update({ locked: false }).eq("bulan", bulan);
+      if (r2.error) throw r2.error;
+    };
+
+    // ─── Aksi: Tutup Buku ────────────────────────────────────────────────────
+    const doClose = async (forcedWarnings) => {
+      setBusy(true);
+      try {
+        const snap = await hitungSnapshot();
+        const { data: sess } = await sb.auth.getSession();
+        const uid = sess?.session?.user?.id || null;
+
+        const { error } = await sb.from("tutupBuku").insert({
+          bulan,
+          versi: (current?.versi || 0) + 1,
+          is_current: true,
+          omzet: snap.omzet,
+          hpp: snap.hpp,
+          pengeluaran_lapak: snap.pengeluaranLapak,
+          pengeluaran_owner: snap.pengeluaranOwner,
+          gaji_total: snap.gajiTotal,
+          laba_bersih: snap.labaBersih,
+          tx_count: snap.txCount,
+          detail: snap.detail,
+          checklist_warnings: forcedWarnings || [],
+          closed_by: uid,
+        });
+        if (error) throw error;
+
+        await kunciDataBulan();
+        await loadCurrent();
+        setChecklist(null);
+        pushNotif(`Buku bulan ${bulan} berhasil ditutup.`, "success");
+      } catch (e) {
+        pushNotif("Gagal tutup buku: " + (e?.message || e), "warning");
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    const askClose = async () => {
+      const warnings = await runChecklist();
+      if (warnings === null) return;
+
+      if (warnings.length === 0) {
+        confirmAsk({
+          title: "Tutup Buku " + bulan,
+          message: "Semua checklist aman. Setelah ditutup, data bulan ini akan dikunci dan tidak bisa dihapus/diubah kecuali dibuka lagi secara manual. Lanjutkan?",
+          onConfirm: () => doClose([]),
+        });
+      } else {
+        confirmAsk({
+          title: "⚠️ Ada yang belum beres — tetap tutup buku?",
+          message: warnings.join("\n") + "\n\nKamu tetap bisa memaksa tutup buku, tapi angka di atas akan ikut tercatat sebagai peringatan di riwayat. Lanjutkan?",
+          onConfirm: () => doClose(warnings),
+        });
+      }
+    };
+
+    // ─── Aksi: Buka Kunci (Reopen) ───────────────────────────────────────────
+    const askReopen = () => {
+      confirmAsk({
+        title: "Buka Kunci Buku " + bulan,
+        message: "Ketik alasan buka kunci (wajib diisi, akan tersimpan permanen di riwayat):",
+        requireText: true,
+        textLabel: "Alasan buka kunci",
+        textPlaceholder: "Contoh: ada koreksi setoran yang terlewat...",
+        confirmLabel: "Buka Kunci",
+        onConfirm: async (reasonInput) => {
+          if (!reasonInput || !reasonInput.trim()) {
+            pushNotif("Alasan wajib diisi untuk buka kunci buku.", "warning");
+            throw new Error("Alasan kosong");
+          }
+          setBusy(true);
+          try {
+            const { data: sess } = await sb.auth.getSession();
+            const uid = sess?.session?.user?.id || null;
+            const { error } = await sb
+              .from("tutupBuku")
+              .update({ is_current: false, reopened_by: uid, reopened_at: new Date().toISOString(), reopen_reason: reasonInput.trim() })
+              .eq("id", current.id);
+            if (error) throw error;
+            await bukaKunciDataBulan();
+            await loadCurrent();
+            pushNotif("Buku dibuka. Data bulan ini bisa diedit lagi — jangan lupa tutup ulang setelah selesai.", "warning");
+          } catch (e) {
+            pushNotif("Gagal buka kunci: " + (e?.message || e), "warning");
+            throw e;
+          } finally {
+            setBusy(false);
+          }
+        },
+      });
+    };
+
+    // ─── Export Excel — baca dari snapshot beku, BUKAN hitung ulang ─────────
+    const exportExcel = () => {
+      if (!current) { pushNotif("Belum ada buku yang ditutup untuk bulan ini.", "warning"); return; }
+      if (typeof XLSX === "undefined") {
+        pushNotif("Library Excel belum termuat. Pastikan xlsx.full.min.js sudah ditambahkan di index.html.", "warning");
+        return;
+      }
+      const d = current.detail || {};
+      const wb = XLSX.utils.book_new();
+
+      const ringkasan = [
+        ["Bulan", current.bulan],
+        ["Versi", current.versi],
+        ["Ditutup pada", current.closed_at],
+        [],
+        ["Omzet", current.omzet],
+        ["HPP", current.hpp],
+        ["Pengeluaran Lapak", current.pengeluaran_lapak],
+        ["Pengeluaran Owner", current.pengeluaran_owner],
+        ["Gaji (info status bayar — sudah termasuk di Pengeluaran Owner, bukan biaya tambahan)", current.gaji_total],
+        ["Laba Bersih", current.laba_bersih],
+        ["Jumlah Transaksi", current.tx_count],
+      ];
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(ringkasan), "Ringkasan");
+
+      if (d.perCabang) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(d.perCabang), "Per Cabang");
+      if (d.transaksi) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(d.transaksi.map((t) => ({
+        tanggal: t.date, branchId: t.branchId, total: t.total, totalHPP: t.totalHPP,
+        items: (t.items || []).map((i) => i.nama + " x" + i.qty).join(", "),
+      }))), "Transaksi");
+      if (d.pengeluaranLapak) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(d.pengeluaranLapak), "Pengeluaran Lapak");
+      if (d.pengeluaranOwner) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(d.pengeluaranOwner), "Pengeluaran Owner");
+      if (d.gajiPembayaran) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(d.gajiPembayaran), "Gaji");
+
+      XLSX.writeFile(wb, `TutupBuku_${current.bulan}_v${current.versi}.xlsx`);
+    };
+
+    // ─── Export Excel KHUSUS 1 investor — sengaja file terpisah, sengaja TIDAK
+    // reuse exportExcel() di atas, supaya tidak ada risiko investor kebagian
+    // sheet cabang lain/data owner kalau suatu saat kode di atas berubah.
+    const exportExcelInvestor = (investorId) => {
+      if (!current) { pushNotif("Belum ada buku yang ditutup untuk bulan ini.", "warning"); return; }
+      if (typeof XLSX === "undefined") { pushNotif("Library Excel belum termuat.", "warning"); return; }
+
+      const d = current.detail || {};
+      const infoInvestor = (d.perInvestor || []).find((i) => i.investorId === investorId);
+      if (!infoInvestor) { pushNotif("Data investor ini tidak ditemukan di snapshot bulan ini.", "warning"); return; }
+
+      const cabangIds = (d.perCabang || [])
+        .filter((c) => c.tipe === "investasi" && c.investorId === investorId)
+        .map((c) => c.branchId);
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([
+        ["Investor", infoInvestor.investorNama],
+        ["Bulan", current.bulan],
+        ["Cabang", infoInvestor.cabang.join(", ")],
+        [],
+        ["Omzet", infoInvestor.omzet],
+        ["HPP", infoInvestor.hpp],
+        ["Pengeluaran", infoInvestor.pengeluaran],
+        ["Laba", infoInvestor.laba],
+      ]), "Ringkasan");
+
+      const txMilikInvestor = (d.transaksi || []).filter((t) => cabangIds.includes(t.branchId));
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(txMilikInvestor.map((t) => ({
+        tanggal: t.date, total: t.total, totalHPP: t.totalHPP,
+        items: (t.items || []).map((i) => i.nama + " x" + i.qty).join(", "),
+      }))), "Transaksi");
+
+      XLSX.writeFile(wb, `Laporan_${infoInvestor.investorNama}_${current.bulan}.xlsx`);
+    };
+
+    // ─── UI ──────────────────────────────────────────────────────────────────
+    return React.createElement("div", { className: "card" },
+      React.createElement("h3", null, "Tutup Buku Bulanan"),
+      React.createElement("input", {
+        type: "month", value: bulan, onChange: (e) => setBulan(e.target.value), disabled: busy,
+      }),
+
+      loadingCurrent && React.createElement("p", null, "Memuat status..."),
+
+      !loadingCurrent && current && React.createElement("div", { className: "info-box" },
+        React.createElement("p", null, `✅ Bulan ${bulan} SUDAH DITUTUP (versi ${current.versi}) pada ${current.closed_at}.`),
+        current.checklist_warnings?.length > 0 && React.createElement("p", { style: { color: "var(--red)" } },
+          "Ditutup dengan peringatan: " + current.checklist_warnings.join("; ")
+        ),
+        current.detail?.totalMandiri && React.createElement("p", null,
+          `Laba Cabang Mandiri (punya sendiri): Rp${current.detail.totalMandiri.laba?.toLocaleString?.("id-ID") ?? current.detail.totalMandiri.laba}`
+        ),
+        current.detail?.totalInvestasi && React.createElement("p", null,
+          `Laba Cabang Investasi (harus dibagi ke investor): Rp${current.detail.totalInvestasi.laba?.toLocaleString?.("id-ID") ?? current.detail.totalInvestasi.laba}`
+        ),
+        React.createElement("button", { className: "btn-secondary", onClick: exportExcel, disabled: busy }, "📥 Download Excel Lengkap (Owner)"),
+        (current.detail?.perInvestor || []).map((inv) =>
+          React.createElement("button", {
+            key: inv.investorId, className: "btn-secondary", disabled: busy,
+            onClick: () => exportExcelInvestor(inv.investorId),
+          }, `📥 Excel untuk ${inv.investorNama}`)
+        ),
+        React.createElement("button", { className: "btn-danger-sm", onClick: askReopen, disabled: busy }, "Buka Kunci")
+      ),
+
+      !loadingCurrent && !current && React.createElement("div", null,
+        React.createElement("p", null, `Bulan ${bulan} belum ditutup.`),
+        React.createElement("button", { className: "btn-primary", onClick: askClose, disabled: busy }, busy ? "Memproses..." : "Tutup Buku Bulan Ini")
+      ),
+
+      confirmModal
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // TutupBukuTahunan — penutupan resmi TAHUNAN (checklist #5.4 / #4.6).
+  //
+  // BEDA PENTING dari TutupBuku bulanan: komponen ini TIDAK menghitung ulang
+  // dari tabel transaksi/pengeluaran mentah. Ia mengAGREGASI dari 12 snapshot
+  // TutupBuku BULANAN yang sudah resmi ditutup (tabel "tutupBuku", is_current).
+  // Alasannya: begitu suatu bulan resmi ditutup, angka bulan itu adalah angka
+  // FINAL yang berlaku secara bisnis — Tahunan harus mencerminkan angka resmi
+  // itu, bukan hitung ulang terpisah yang bisa saja beda kalau ada data lama
+  // yang berubah setelah bulan itu ditutup (tanggal terkunci lewat
+  // isSetoranLocked/DAY_LOCK_LINKED_TABLES, tapi tetap bisa diedit lagi kalau
+  // ownernya sengaja buka kunci bulan itu).
+  //
+  // Konsekuensinya: bulan yang BELUM ditutup buku bulanan otomatis tercatat 0
+  // di agregat tahunan ini (bukan diam-diam dihitung dari data mentahnya) dan
+  // muncul sebagai peringatan checklist — supaya tidak ada sumber angka yang
+  // bercampur di 1 laporan yang sama. Kalau butuh lihat estimasi LIVE tahun
+  // ini sebelum semua bulan ditutup, pakai tab "Performa" > Tahunan (itu yang
+  // hitung langsung dari data mentah, real-time).
+  // ═══════════════════════════════════════════════════════════════════════
+  function TutupBukuTahunan({ pushNotif }) {
+    const [confirmAsk, confirmModal] = useConfirm();
+    const [tahun, setTahun] = useState(() => new Date().toISOString().slice(0, 4)); // "YYYY"
+    const [busy, setBusy] = useState(false);
+    const [current, setCurrent] = useState(null); // baris tutupBukuTahunan is_current untuk tahun ini, kalau ada
+    const [loadingCurrent, setLoadingCurrent] = useState(false);
+
+    const bulanList = useMemo(() => Array.from({ length: 12 }, (_, i) => `${tahun}-${String(i + 1).padStart(2, "0")}`), [tahun]);
+
+    // ─── Ambil status penutupan tahun yang sedang dipilih ───────────────────
+    const loadCurrent = useCallback(async () => {
+      setLoadingCurrent(true);
+      try {
+        const { data, error } = await sb
+          .from("tutupBukuTahunan")
+          .select("*")
+          .eq("tahun", tahun)
+          .eq("is_current", true)
+          .maybeSingle();
+        if (error) throw error;
+        setCurrent(data || null);
+      } catch (e) {
+        pushNotif("Gagal cek status tutup buku tahunan: " + (e?.message || e), "warning");
+      } finally {
+        setLoadingCurrent(false);
+      }
+    }, [tahun]);
+
+    useEffect(() => { loadCurrent(); }, [loadCurrent]);
+
+    // ─── Ambil 12 snapshot bulanan yang sudah resmi tertutup untuk tahun ini ─
+    const ambilSnapshotBulanan = async () => {
+      const { data, error } = await sb
+        .from("tutupBuku")
+        .select("*")
+        .gte("bulan", tahun + "-01")
+        .lte("bulan", tahun + "-12")
+        .eq("is_current", true);
+      if (error) throw error;
+      return data || [];
+    };
+
+    // ─── Checklist: pastikan semua bulan (yang sudah lewat) di tahun ini
+    // sudah ditutup buku bulanan dulu, sebelum boleh tutup tahunan ──────────
+    const runChecklist = async () => {
+      setBusy(true);
+      try {
+        const warnings = [];
+        const rows = await ambilSnapshotBulanan();
+        const bulanSudahTutup = new Set(rows.map((r) => r.bulan));
+        // Cuma bulan yang sudah lewat/berjalan yang wajib dicek — bulan masa
+        // depan di tahun yang sama jelas belum bisa ditutup, bukan masalah.
+        const bulanIni = today().slice(0, 7);
+        const belumTutup = bulanList.filter((b) => b <= bulanIni && !bulanSudahTutup.has(b));
+        if (belumTutup.length > 0) {
+          warnings.push(`${belumTutup.length} bulan belum ditutup buku bulanan: ${belumTutup.join(", ")}. Bulan-bulan ini TIDAK ikut terhitung di Tutup Buku Tahunan sampai ditutup dulu lewat menu Bulanan.`);
+        }
+        const ditutupDenganPeringatan = rows.filter((r) => (r.checklist_warnings || []).length > 0);
+        if (ditutupDenganPeringatan.length > 0) {
+          warnings.push(`${ditutupDenganPeringatan.length} bulan sebelumnya ditutup dengan peringatan yang dipaksa lewat: ${ditutupDenganPeringatan.map((r) => r.bulan).join(", ")}.`);
+        }
+        return warnings;
+      } catch (e) {
+        pushNotif("Gagal jalankan checklist: " + (e?.message || e), "warning");
+        return null;
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    // ─── Hitung snapshot tahunan — AGREGASI dari 12 snapshot bulanan ────────
+    const hitungSnapshot = async () => {
+      const rows = await ambilSnapshotBulanan();
+      const investorsAll = S.get("investors") || [];
+
+      const omzet = rows.reduce((a, r) => a + (r.omzet || 0), 0);
+      const hpp = rows.reduce((a, r) => a + (r.hpp || 0), 0);
+      const pengeluaranLapak = rows.reduce((a, r) => a + (r.pengeluaran_lapak || 0), 0);
+      const pengeluaranOwner = rows.reduce((a, r) => a + (r.pengeluaran_owner || 0), 0);
+      const gajiTotal = rows.reduce((a, r) => a + (r.gaji_total || 0), 0);
+      const labaBersih = rows.reduce((a, r) => a + (r.laba_bersih || 0), 0);
+      const txCount = rows.reduce((a, r) => a + (r.tx_count || 0), 0);
+
+      // ─── Ringkasan per bulan, buat tabel tren 12 bulan di laporan ─────────
+      const perBulan = bulanList.map((b) => {
+        const r = rows.find((x) => x.bulan === b);
+        return {
+          bulan: b, ditutup: !!r,
+          omzet: r?.omzet || 0, hpp: r?.hpp || 0,
+          pengeluaran: (r?.pengeluaran_lapak || 0) + (r?.pengeluaran_owner || 0),
+          laba: r?.laba_bersih || 0, txCount: r?.tx_count || 0,
+        };
+      });
+
+      // ─── Agregasi per cabang, dari detail.perCabang tiap snapshot bulanan ─
+      const perCabangMap = {};
+      rows.forEach((r) => {
+        (r.detail?.perCabang || []).forEach((c) => {
+          if (!perCabangMap[c.branchId]) {
+            perCabangMap[c.branchId] = {
+              branchId: c.branchId, nama: c.nama, tipe: c.tipe,
+              investorId: c.investorId || null, investorNama: c.investorNama || null,
+              omzet: 0, hpp: 0, pengeluaranLapak: 0, pengeluaranOwner: 0, laba: 0, txCount: 0,
+            };
+          }
+          const acc = perCabangMap[c.branchId];
+          acc.omzet += c.omzet || 0; acc.hpp += c.hpp || 0;
+          acc.pengeluaranLapak += c.pengeluaranLapak || 0; acc.pengeluaranOwner += c.pengeluaranOwner || 0;
+          acc.laba += c.laba || 0; acc.txCount += c.txCount || 0;
+        });
+      });
+      const perCabang = Object.values(perCabangMap);
+
+      // ─── Total mandiri vs investasi — dihitung dari perCabang agregat di
+      // atas (BUKAN dari kolom totalMandiri/totalInvestasi tiap bulan),
+      // supaya tetap benar walau ada snapshot bulan lama dari SEBELUM fix
+      // bug totalMandiri/totalInvestasi di hitungSnapshot (TutupBuku) ───────
+      const sumTipe = (tipe) => {
+        const rowsT = perCabang.filter((c) => (tipe === "investasi" ? c.tipe === "investasi" : c.tipe !== "investasi"));
+        return {
+          omzet: rowsT.reduce((a, c) => a + c.omzet, 0),
+          hpp: rowsT.reduce((a, c) => a + c.hpp, 0),
+          pengeluaran: rowsT.reduce((a, c) => a + c.pengeluaranLapak + c.pengeluaranOwner, 0),
+          laba: rowsT.reduce((a, c) => a + c.laba, 0),
+          txCount: rowsT.reduce((a, c) => a + c.txCount, 0),
+        };
+      };
+      const totalMandiri = sumTipe("mandiri");
+      const totalInvestasi = sumTipe("investasi");
+
+      const perInvestor = investorsAll.map((inv) => {
+        const rowsT = perCabang.filter((c) => c.tipe === "investasi" && c.investorId === inv.id);
+        return {
+          investorId: inv.id, investorNama: inv.nama,
+          cabang: rowsT.map((c) => c.nama),
+          omzet: rowsT.reduce((a, c) => a + c.omzet, 0),
+          hpp: rowsT.reduce((a, c) => a + c.hpp, 0),
+          pengeluaran: rowsT.reduce((a, c) => a + c.pengeluaranLapak + c.pengeluaranOwner, 0),
+          laba: rowsT.reduce((a, c) => a + c.laba, 0),
+        };
+      }).filter((i) => i.cabang.length > 0);
+
+      return {
+        omzet, hpp, pengeluaranLapak, pengeluaranOwner, gajiTotal, labaBersih, txCount,
+        bulanTertutup: rows.length,
+        detail: { perBulan, perCabang, perInvestor, totalMandiri, totalInvestasi },
+      };
+    };
+
+    // ─── Aksi: Tutup Buku Tahunan ────────────────────────────────────────────
+    const doClose = async (forcedWarnings) => {
+      setBusy(true);
+      try {
+        const snap = await hitungSnapshot();
+        const { data: sess } = await sb.auth.getSession();
+        const uid = sess?.session?.user?.id || null;
+
+        const { error } = await sb.from("tutupBukuTahunan").insert({
+          tahun,
+          versi: (current?.versi || 0) + 1,
+          is_current: true,
+          omzet: snap.omzet,
+          hpp: snap.hpp,
+          pengeluaran_lapak: snap.pengeluaranLapak,
+          pengeluaran_owner: snap.pengeluaranOwner,
+          gaji_total: snap.gajiTotal,
+          laba_bersih: snap.labaBersih,
+          tx_count: snap.txCount,
+          bulan_tertutup: snap.bulanTertutup,
+          detail: snap.detail,
+          checklist_warnings: forcedWarnings || [],
+          closed_by: uid,
+        });
+        if (error) throw error;
+
+        await loadCurrent();
+        pushNotif(`Buku tahun ${tahun} berhasil ditutup.`, "success");
+      } catch (e) {
+        pushNotif("Gagal tutup buku tahunan: " + (e?.message || e), "warning");
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    const askClose = async () => {
+      const warnings = await runChecklist();
+      if (warnings === null) return;
+
+      if (warnings.length === 0) {
+        confirmAsk({
+          title: "Tutup Buku Tahunan " + tahun,
+          message: "Semua bulan tahun ini sudah ditutup buku bulanan. Tutup Buku Tahunan akan mengagregasi 12 angka resmi bulanan itu jadi 1 laporan tahunan. Lanjutkan?",
+          onConfirm: () => doClose([]),
+        });
+      } else {
+        confirmAsk({
+          title: "⚠️ Ada yang belum beres — tetap tutup buku tahunan?",
+          message: warnings.join("\n") + "\n\nKamu tetap bisa memaksa tutup buku tahunan, tapi bulan yang belum ditutup TIDAK ikut terhitung sampai ditutup menyusul (butuh versi baru kalau mau update). Lanjutkan?",
+          onConfirm: () => doClose(warnings),
+        });
+      }
+    };
+
+    // ─── Aksi: Buka Kunci (Reopen) ───────────────────────────────────────────
+    const askReopen = () => {
+      confirmAsk({
+        title: "Buka Kunci Buku Tahunan " + tahun,
+        message: "Ketik alasan buka kunci (wajib diisi, akan tersimpan permanen di riwayat):",
+        requireText: true,
+        textLabel: "Alasan buka kunci",
+        textPlaceholder: "Contoh: ada bulan yang perlu ditutup ulang setelah koreksi...",
+        confirmLabel: "Buka Kunci",
+        onConfirm: async (reasonInput) => {
+          if (!reasonInput || !reasonInput.trim()) {
+            pushNotif("Alasan wajib diisi untuk buka kunci buku tahunan.", "warning");
+            throw new Error("Alasan kosong");
+          }
+          setBusy(true);
+          try {
+            const { data: sess } = await sb.auth.getSession();
+            const uid = sess?.session?.user?.id || null;
+            const { error } = await sb
+              .from("tutupBukuTahunan")
+              .update({ is_current: false, reopened_by: uid, reopened_at: new Date().toISOString(), reopen_reason: reasonInput.trim() })
+              .eq("id", current.id);
+            if (error) throw error;
+            await loadCurrent();
+            pushNotif("Buku tahunan dibuka. Jangan lupa tutup ulang setelah selesai koreksi.", "warning");
+          } catch (e) {
+            pushNotif("Gagal buka kunci: " + (e?.message || e), "warning");
+            throw e;
+          } finally {
+            setBusy(false);
+          }
+        },
+      });
+    };
+
+    // ─── Export Excel — baca dari snapshot beku, BUKAN hitung ulang ─────────
+    const exportExcel = () => {
+      if (!current) { pushNotif("Belum ada buku tahunan yang ditutup untuk tahun ini.", "warning"); return; }
+      if (typeof XLSX === "undefined") {
+        pushNotif("Library Excel belum termuat. Pastikan xlsx.full.min.js sudah ditambahkan di index.html.", "warning");
+        return;
+      }
+      const d = current.detail || {};
+      const wb = XLSX.utils.book_new();
+
+      const ringkasan = [
+        ["Tahun", current.tahun],
+        ["Versi", current.versi],
+        ["Ditutup pada", current.closed_at],
+        ["Bulan tertutup", (current.bulan_tertutup ?? 0) + " / 12"],
+        [],
+        ["Omzet", current.omzet],
+        ["HPP", current.hpp],
+        ["Pengeluaran Lapak", current.pengeluaran_lapak],
+        ["Pengeluaran Owner", current.pengeluaran_owner],
+        ["Gaji (info status bayar — sudah termasuk di Pengeluaran Owner, bukan biaya tambahan)", current.gaji_total],
+        ["Laba Bersih", current.laba_bersih],
+        ["Jumlah Transaksi", current.tx_count],
+      ];
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(ringkasan), "Ringkasan");
+
+      if (d.perBulan) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(d.perBulan), "Per Bulan");
+      if (d.perCabang) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(d.perCabang), "Per Cabang");
+      if (d.perInvestor) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+        d.perInvestor.map((i) => ({ ...i, cabang: (i.cabang || []).join(", ") }))
+      ), "Per Investor");
+
+      XLSX.writeFile(wb, `TutupBukuTahunan_${current.tahun}_v${current.versi}.xlsx`);
+    };
+
+    // ─── Export Excel KHUSUS 1 investor — file terpisah, sama alasannya
+    // seperti versi bulanan (lihat exportExcelInvestor di TutupBuku) ────────
+    const exportExcelInvestor = (investorId) => {
+      if (!current) { pushNotif("Belum ada buku tahunan yang ditutup untuk tahun ini.", "warning"); return; }
+      if (typeof XLSX === "undefined") { pushNotif("Library Excel belum termuat.", "warning"); return; }
+
+      const d = current.detail || {};
+      const info = (d.perInvestor || []).find((i) => i.investorId === investorId);
+      if (!info) { pushNotif("Data investor ini tidak ditemukan di snapshot tahun ini.", "warning"); return; }
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([
+        ["Investor", info.investorNama],
+        ["Tahun", current.tahun],
+        ["Cabang", info.cabang.join(", ")],
+        [],
+        ["Omzet", info.omzet],
+        ["HPP", info.hpp],
+        ["Pengeluaran", info.pengeluaran],
+        ["Laba", info.laba],
+      ]), "Ringkasan");
+
+      XLSX.writeFile(wb, `Laporan_${info.investorNama}_Tahun${current.tahun}.xlsx`);
+    };
+
+    // ─── UI ──────────────────────────────────────────────────────────────────
+    return React.createElement("div", { className: "card" },
+      React.createElement("h3", null, "Tutup Buku Tahunan"),
+      React.createElement("select", { className: "inp", value: tahun, onChange: (e) => setTahun(e.target.value), disabled: busy },
+        Array.from({ length: 6 }, (_, i) => new Date().getFullYear() - 4 + i).map((y) =>
+          React.createElement("option", { key: y, value: String(y) }, String(y))
+        )
+      ),
+
+      loadingCurrent && React.createElement("p", null, "Memuat status..."),
+
+      !loadingCurrent && current && React.createElement("div", { className: "info-box" },
+        React.createElement("p", null, `✅ Tahun ${tahun} SUDAH DITUTUP (versi ${current.versi}) pada ${current.closed_at}. (${current.bulan_tertutup ?? 0}/12 bulan resmi tertutup ikut terhitung.)`),
+        current.checklist_warnings?.length > 0 && React.createElement("p", { style: { color: "var(--red)" } },
+          "Ditutup dengan peringatan: " + current.checklist_warnings.join("; ")
+        ),
+        current.detail?.totalMandiri && React.createElement("p", null,
+          `Laba Cabang Mandiri (punya sendiri): Rp${current.detail.totalMandiri.laba?.toLocaleString?.("id-ID") ?? current.detail.totalMandiri.laba}`
+        ),
+        current.detail?.totalInvestasi && React.createElement("p", null,
+          `Laba Cabang Investasi (harus dibagi ke investor): Rp${current.detail.totalInvestasi.laba?.toLocaleString?.("id-ID") ?? current.detail.totalInvestasi.laba}`
+        ),
+        React.createElement("div", { className: "mt8" },
+          React.createElement("h4", null, "Ringkasan per Bulan"),
+          (current.detail?.perBulan || []).map((b) =>
+            React.createElement("div", {
+              key: b.bulan, style: { display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid var(--border)", opacity: b.ditutup ? 1 : 0.5 },
+            },
+              React.createElement("span", null, b.bulan, !b.ditutup && " (belum ditutup)"),
+              React.createElement("span", null, "Omzet ", fmtRp(b.omzet), " · Laba ", fmtRp(b.laba))
+            )
+          )
+        ),
+        React.createElement("button", { className: "btn-secondary mt8", onClick: exportExcel, disabled: busy }, "📥 Download Excel Lengkap (Owner)"),
+        (current.detail?.perInvestor || []).map((inv) =>
+          React.createElement("button", {
+            key: inv.investorId, className: "btn-secondary", disabled: busy,
+            onClick: () => exportExcelInvestor(inv.investorId),
+          }, `📥 Excel untuk ${inv.investorNama}`)
+        ),
+        React.createElement("button", { className: "btn-danger-sm", onClick: askReopen, disabled: busy }, "Buka Kunci")
+      ),
+
+      !loadingCurrent && !current && React.createElement("div", null,
+        React.createElement("p", null, `Tahun ${tahun} belum ditutup buku tahunan.`),
+        React.createElement("button", { className: "btn-primary", onClick: askClose, disabled: busy }, busy ? "Memproses..." : "Tutup Buku Tahun Ini")
+      ),
+
+      confirmModal
+    );
+  }
+
+  // ─── TutupBukuPanel — toggle Bulanan/Tahunan di 1 tab menu yang sama
+  // ("Tutup Buku"), supaya tidak perlu nambah item baru di sidebar. Pola
+  // togglenya sama seperti Mingguan/Bulanan/Tahunan di PerformaPeriode. ─────
+  function TutupBukuPanel({ pushNotif }) {
+    const [mode, setMode] = useState("bulan"); // "bulan" | "tahun"
+    return React.createElement("div", null,
+      React.createElement("div", { className: "tabs mb8" },
+        React.createElement("button", { className: "tab" + (mode === "bulan" ? " active" : ""), onClick: () => setMode("bulan") }, "Bulanan"),
+        React.createElement("button", { className: "tab" + (mode === "tahun" ? " active" : ""), onClick: () => setMode("tahun") }, "Tahunan")
+      ),
+      mode === "bulan" ? React.createElement(TutupBuku, { pushNotif }) : React.createElement(TutupBukuTahunan, { pushNotif })
+    );
+  }
+
+  // Helper: "2026-07" -> "2026-08-01" (dipakai untuk filter `date < to`, exclusive)
+  function nextMonthStr(bulanStr) {
+    const [y, m] = bulanStr.split("-").map(Number);
+    const nm = m === 12 ? 1 : m + 1;
+    const ny = m === 12 ? y + 1 : y;
+    return `${ny}-${String(nm).padStart(2, "0")}-01`;
+  }
+
   // ─── SettingData ───────────────────────────────────────────────────────────
   function SettingData({ pushNotif }) {
     const [busy, setBusy] = useState(false);
@@ -4016,9 +5308,36 @@ function SettingAkun({ pushNotif }) {
     // cuma dilewati oleh logic JS seperti sebelumnya.
     const RLS_LOCKED_TABLES = ["setoranHarian", "absensiBulanan"];
 
+    // Tabel yang datanya terikat ke satu kombinasi cabang+tanggal tertentu, dan
+    // harus ikut dilindungi kalau Setoran (setoranHarian) untuk cabang+tanggal
+    // yang SAMA masih terkunci — supaya laporan yang sudah dikonfirmasi tidak
+    // jadi tidak akurat karena data mentah di baliknya kehapus lewat tombol
+    // lain (Transaksi/Pengeluaran/Distribusi CK/Donat Tidak Terjual).
+    // SENGAJA tidak termasuk: stokLapak (tidak punya kolom tanggal), produksiCK
+    // (branchId-nya milik Central Kitchen, tidak akan pernah cocok dengan
+    // setoran lapak manapun), dan setoranHarian/absensiBulanan sendiri (sudah
+    // punya mekanisme proteksi terpisah di atas).
+    const DAY_LOCK_LINKED_TABLES = ["transactions", "pengeluaranLapak", "pengeluaranOwner", "distribusiCK", "stokTidakTerjual", "absensi"];
+
+    // Ambil (branchId, date) yang masih terkunci, dibatasi ke scope cabang/
+    // tanggal yang sedang difilter — supaya tidak menarik seluruh histori
+    // kalau owner cuma mau hapus data 1 hari.
+    const getLockedDayKeys = async () => {
+      const q = applyScopeFilters(sb.from("setoranHarian").select("branchId, date"), "setoranHarian").eq("locked", true);
+      const { data, error } = await q;
+      if (error) throw error;
+      return new Set((data || []).map((r) => r.branchId + "|" + r.date));
+    };
+
     const runClear = async (label, tables, keysToReload) => {
       setBusy(true);
       try {
+        // Kalau tidak ada satupun tabel di daftar ini yang mau dihapus (atau
+        // ownernya sudah sengaja mencentang "sertakan data terkunci"), lewati
+        // pengecekan ini total — jalur kode di bawah tetap 100% seperti semula.
+        const needsDayLockCheck = !includeLocked && tables.some((t) => DAY_LOCK_LINKED_TABLES.includes(t));
+        const lockedDayKeys = needsDayLockCheck ? await getLockedDayKeys() : new Set();
+
         for (const t of tables) {
           if (selDate && t === "stokLapak") throw new Error("Stok Lapak tidak punya kolom tanggal yang aman untuk filter hapus. Kosongkan tanggal jika memang ingin hapus stok lapak.");
 
@@ -4026,6 +5345,26 @@ function SettingAkun({ pushNotif }) {
             const unlockQuery = applyScopeFilters(sb.from(t).update({ locked: false }).eq("locked", true), t);
             const { error: unlockErr } = await unlockQuery;
             if (unlockErr) throw unlockErr;
+          }
+
+          // Kalau ada hari terkunci dalam scope ini DAN tabel ini termasuk yang
+          // ikut dilindungi: ambil dulu baris kandidatnya, sisihkan (di JS, bukan
+          // di filter SQL) yang cabang+tanggalnya masih terkunci, baru hapus
+          // sisanya berdasarkan id persis. Kalau lockedDayKeys kosong (tidak ada
+          // yang terkunci dalam scope ini), blok ini dilewati total dan jalur di
+          // bawahnya (yang lama, tidak berubah) yang jalan — jadi tidak ada efek
+          // apapun untuk kasus yang paling umum (tidak ada yang terkunci).
+          if (lockedDayKeys.size > 0 && DAY_LOCK_LINKED_TABLES.includes(t)) {
+            const { data: candidates, error: selErr } = await applyScopeFilters(sb.from(t).select("id, branchId, date"), t);
+            if (selErr) throw selErr;
+            const idsToDelete = (candidates || [])
+              .filter((r) => !lockedDayKeys.has(r.branchId + "|" + r.date))
+              .map((r) => r.id);
+            if (idsToDelete.length > 0) {
+              const { error: delErr } = await sb.from(t).delete().in("id", idsToDelete);
+              if (delErr) throw delErr;
+            }
+            continue;
           }
 
           let query = applyScopeFilters(sb.from(t).delete().neq("id", "00000000-0000-0000-0000-000000000000"), t);
@@ -4041,16 +5380,30 @@ function SettingAkun({ pushNotif }) {
       const branchName = selBranch ? branches.find((b) => b.id === selBranch)?.name : "SEMUA CABANG";
       const dateName = selDate ? formatTanggalIndo(selDate) : "SEMUA TANGGAL";
       const hasProtectedTable = tables.some((t) => ["setoranHarian", "absensiBulanan", "setoranBulanan", "gajiPembayaran"].includes(t));
+      const isDeleteAllDates = !selDate;
+
       confirmAsk({
-        title: "Hapus Data: " + label,
-        message: `Cabang: ${branchName} | Tanggal: ${dateName}. Tindakan ini tidak bisa dibatalkan.` +
+        title: isDeleteAllDates ? "⚠️ BAHAYA — Hapus SEMUA Tanggal: " + label : "Hapus Data: " + label,
+        message: (isDeleteAllDates
+            ? `Kolom tanggal KOSONG. Ini akan menghapus "${label}" untuk SEMUA TANGGAL yang pernah tercatat (cabang: ${branchName}), bukan cuma hari ini. Ini biasanya cuma dipakai waktu masih uji coba — kalau app sudah dipakai untuk data asli, isi dulu tanggalnya di atas sebelum lanjut, atau ketik persis "HAPUS SEMUA" di bawah untuk tetap lanjut.`
+            : `Cabang: ${branchName} | Tanggal: ${dateName}. Tindakan ini tidak bisa dibatalkan.`) +
           (hasProtectedTable
             ? (includeLocked
                 ? " ⚠️ Kamu MENCENTANG \"sertakan data terkunci\" — data yang sudah dikonfirmasi/dikunci JUGA akan ikut terhapus."
                 : " Data yang sudah dikonfirmasi/dikunci akan DILEWATI otomatis (aman).")
             : ""),
         confirmLabel: "Ya, Hapus " + label,
-        onConfirm: () => runClear(label, tables, keysToReload)
+        danger: true,
+        requireText: isDeleteAllDates,
+        textLabel: isDeleteAllDates ? 'Ketik persis: HAPUS SEMUA' : undefined,
+        textPlaceholder: isDeleteAllDates ? "HAPUS SEMUA" : undefined,
+        onConfirm: (textValue) => {
+          if (isDeleteAllDates && (textValue || "").trim() !== "HAPUS SEMUA") {
+            pushNotif('Dibatalkan — ketikan tidak sama persis dengan "HAPUS SEMUA".', "warning");
+            throw new Error("confirmation phrase mismatch");
+          }
+          return runClear(label, tables, keysToReload);
+        }
       });
     };
 
@@ -4344,12 +5697,14 @@ function SettingAkun({ pushNotif }) {
         )
       ),
       tab === "dashboard"   && React.createElement(OwnerDashboard, null),
+      tab === "performaPeriode" && React.createElement(PerformaPeriode, { pushNotif }),
       tab === "kasir"       && React.createElement(WorkerPage, { pushNotif, me, mode: "owner", historyMode }),
       tab === "setoran"     && React.createElement(OwnerSetoran, { pushNotif }),
       tab === "laporan"     && React.createElement(OwnerLaporan, { pushNotif }),
       tab === "absensi"     && React.createElement(OwnerAbsensi, { pushNotif }),
       tab === "pengeluaran" && React.createElement(PengeluaranOwner, { pushNotif }),
       tab === "produksiCK"  && React.createElement(OwnerProduksiCK, { pushNotif }),
+      tab === "tutupBuku"   && React.createElement(TutupBukuPanel, { pushNotif }),
       tab === "setting"     && React.createElement(OwnerSetting, { stab, setStab, pushNotif, historyMode, onHistoryModeChange })
     );
   }
@@ -4383,6 +5738,7 @@ function SettingAkun({ pushNotif }) {
     };
 
     const distribAllInv = S.get("distribusiCK") || [];
+    const allBranchesGlobal = S.get("branches") || [];
 
     // Helper: hitung akumulasi untuk rentang cabang + tanggal tertentu langsung dari transaksi
     const calcAccum = (branchIds, dateFilter) => {
@@ -4397,9 +5753,18 @@ function SettingAkun({ pushNotif }) {
       const pLapak = bPL.reduce((a, p) => a + p.jumlah, 0);
       const pOwnerD = bPODirect.reduce((a, p) => a + p.jumlah, 0);
       const pOwnerG = bPOGlobal.reduce((a, p) => a + p.jumlah, 0) / nBranchTotal;
-      const pOwner = pOwnerD + pOwnerG;
+      // Gaji Central Kitchen dibagi PROPORSIONAL ke pcs distribusi yang diterima
+      // tiap cabang pada periode ini — proporsinya dihitung dari po & distribusi
+      // SEMUA cabang sistem (bukan cuma cabang investor ini), baru porsi milik
+      // cabang investor ini yang diambil. Supaya "bagian investor" tidak lagi
+      // dihitung tanpa potongan biaya tenaga kerja CK.
+      const poSemuaPeriodeIni = pOwnerAll.filter((p) => dateFilter(p.date));
+      const distribSemuaPeriodeIni = distribAllInv.filter((d) => dateFilter(d.date));
+      const ckSplit = hitungBiayaCkPerCabang({ po: poSemuaPeriodeIni, distribAll: distribSemuaPeriodeIni, branches: allBranchesGlobal });
+      const pOwnerCk = branchIds.reduce((a, bId) => a + (ckSplit.perBranch[bId] || 0), 0);
+      const pOwner = pOwnerD + pOwnerG + pOwnerCk;
       const laba = omzet - modal - pLapak - pOwner;
-      return { omzet, modal, pLapak, pOwner, laba, txCount: bTxs.length };
+      return { omzet, modal, pLapak, pOwner, pOwnerCk, laba, txCount: bTxs.length };
     };
 
     const branchIds = branches.map((b) => b.id);
@@ -4709,9 +6074,13 @@ function SettingAkun({ pushNotif }) {
         : { id: uid(), user_id: userId, branchId, date: targetDate, checkin_ts: isoForDate(targetDate), checkout_ts: null };
       S.set("absensi", ex ? all.map((a) => a.id === row.id ? row : a) : [...all, row]);
 
-      // ─── Gaji harian CK otomatis masuk sebagai pengeluaran GLOBAL (branchId: null) ───
-      // Pengeluaran global ini otomatis dibagi rata ke semua lapak (cabang non-CK) di Laporan Owner,
-      // karena hasil produksi CK dipakai/disetor ke semua lapak, bukan hanya 1 cabang.
+      // ─── Gaji harian CK masuk sebagai pengeluaran milik CABANG CK SENDIRI ───
+      // (branchId terisi, BUKAN null). hitungBiayaCkPerCabang() di seluruh app
+      // mendeteksi biaya CK lewat branchId yang mengarah ke cabang bertipe
+      // central_kitchen, lalu membaginya PROPORSIONAL ke pcs distribusi yang
+      // diterima tiap cabang hari itu. Kalau branchId di sini null, deteksi
+      // itu tidak pernah cocok — gaji CK diam-diam jatuh ke jalur "global murni"
+      // dan dibagi RATA ke semua cabang seperti dulu, bukan proporsional.
       try {
         const gajiHarian = parseFloat(me?.gajiHarian || 0) || 0;
         if (gajiHarian > 0) {
@@ -4722,7 +6091,7 @@ function SettingAkun({ pushNotif }) {
             const { error } = await sb.from("pengeluaranOwner").insert([{
               id: uid(), date: targetDate, ts: tsForDate(targetDate),
               keterangan: `Gaji Harian CK - ${namaPekerja}`, jumlah: gajiHarian,
-              kategori: "gaji_kitchen", branchId: null, branchName: null,
+              kategori: "gaji_kitchen", branchId, branchName,
               autoGajiUserId: userId
             }]);
             if (!error) await S.loadKey("pengeluaranOwner");
