@@ -2135,6 +2135,45 @@ function useConfirm() {
       });
     };
 
+    // ─── Hapus Distribusi yang MASIH Pending (belum Diterima) ───────────────
+    // Beda dari batalkanDistribusi() di atas: baris berstatus "pending" BELUM
+    // PERNAH menyentuh stokLapak sama sekali (stok baru bertambah nyata saat
+    // dikonfirmasi Diterima), jadi tidak perlu tarik-stok & tidak wajib isi
+    // alasan seperti Retur. Cukup tandai "dibatalkan" (bukan hapus baris fisik,
+    // supaya tetap ada jejaknya) — dan karena hitungBiayaCkPerCabang() &
+    // hitungPerformaPeriode() SUDAH memfilter `status !== "dibatalkan"`, baris
+    // ini otomatis ke-exclude dari semua laporan tanpa perlu ubah rumus lain.
+    // Ini menutup gap: sebelumnya baris Pending yang salah input hanya bisa
+    // dibereskan lewat tombol "X" di Produksi (yang ikut menghapus SEMUA
+    // distribusi pending produksi itu, dan diblokir total kalau ada
+    // saudara-nya yang sudah Diterima) — sekarang bisa langsung per-baris.
+    const hapusDistribusiPending = (d) => {
+      confirmAsk({
+        title: "Hapus Distribusi (Pending)",
+        message: `Hapus distribusi "${d.menuNama}" ke ${d.branchName} (${d.jumlahKirim} pcs)? Statusnya masih Pending — belum ada stok yang berubah, jadi aman dihapus langsung tanpa perlu menunggu dikonfirmasi cabang.`,
+        danger: true,
+        confirmLabel: "Hapus",
+        onConfirm: async () => {
+          setReturBusy((b) => ({ ...b, [d.id]: true }));
+          try {
+            const { data: sess } = await sb.auth.getSession();
+            const uid = sess?.session?.user?.id || null;
+            const { error } = await sb.from("distribusiCK")
+              .update({ status: "dibatalkan", catatanBatal: "Dihapus saat masih Pending (input keliru, belum dikonfirmasi cabang).", batalAt: nowIso(), batalBy: uid })
+              .eq("id", d.id);
+            if (error) throw error;
+            await S.loadKey("distribusiCK");
+            pushNotif("Distribusi pending berhasil dihapus.", "warning");
+          } catch (e) {
+            pushNotif(e?.message || String(e), "warning");
+            throw e;
+          } finally {
+            setReturBusy((b) => { const c = { ...b }; delete c[d.id]; return c; });
+          }
+        },
+      });
+    };
+
     return React.createElement("div", null,
       React.createElement("h3", { className: "section-title mt8" }, "Produksi & Distribusi Central Kitchen"),
       React.createElement("div", { className: "tabs mb8" },
@@ -2294,7 +2333,12 @@ function useConfirm() {
                     d.status === "diterima" ? React.createElement("button", {
                       className: "btn-danger-sm", style: { fontSize: 10 }, disabled: !!returBusy[d.id],
                       onClick: () => batalkanDistribusi(d),
-                    }, returBusy[d.id] ? "..." : "Batalkan") : "-"
+                    }, returBusy[d.id] ? "..." : "Batalkan")
+                    : d.status === "pending" ? React.createElement("button", {
+                      className: "btn-danger-sm", style: { fontSize: 10 }, disabled: !!returBusy[d.id],
+                      onClick: () => hapusDistribusiPending(d),
+                    }, returBusy[d.id] ? "..." : "Hapus")
+                    : "-"
                   )
                 )
               ),
@@ -2825,8 +2869,49 @@ function useConfirm() {
     };
 
     const konfirmBulanan = (id) => {
-      S.set("setoranBulanan", (S.get("setoranBulanan") || []).map((s) => s.id === id ? { ...s, status: "selesai", konfirmasiTs: nowTs(), confirmedBy: "owner" } : s));
-      refresh(); pushNotif("Laporan bulanan dikonfirmasi!", "success");
+      S.set("setoranBulanan", (S.get("setoranBulanan") || []).map((s) => s.id === id ? { ...s, status: "selesai", konfirmasiTs: nowTs(), confirmedBy: "owner", locked: true } : s));
+      refresh(); pushNotif("Laporan bulanan dikonfirmasi & dikunci!", "success");
+    };
+
+    // Buka kunci laporan bulanan yang sudah dikonfirmasi, supaya bisa dihapus/dikoreksi.
+    // Tidak mengubah status "selesai" - cuma buka gembok proteksi hapus (sama pola
+    // dengan bukaKunciSetoran di tab harian).
+    const bukaKunciBulanan = (id) => {
+      S.set("setoranBulanan", (S.get("setoranBulanan") || []).map((s) => s.id === id ? { ...s, locked: false } : s));
+      refresh(); pushNotif("Kunci laporan bulanan dibuka. Sekarang laporan ini bisa dihapus.", "warning");
+    };
+
+    const kunciUlangBulanan = (id) => {
+      S.set("setoranBulanan", (S.get("setoranBulanan") || []).map((s) => s.id === id ? { ...s, locked: true } : s));
+      refresh(); pushNotif("Laporan bulanan dikunci kembali.", "success");
+    };
+
+    // Hapus permanen — sama pola dengan hapusSetoranHarian: delete ke Supabase
+    // dulu, baru percaya tampilan kalau baris yang kehapus di database memang > 0.
+    const hapusSetoranBulananPermanen = async (id) => {
+      try {
+        const { data, error } = await sb.from("setoranBulanan").delete().eq("id", id).select();
+        if (error) throw error;
+        if (!data || data.length === 0) {
+          pushNotif("Tidak ada yang terhapus — kemungkinan data ini masih terkunci di database. Muat ulang halaman lalu coba lagi.", "warning");
+          return;
+        }
+        await S.loadKey("setoranBulanan");
+        refresh();
+        pushNotif("Laporan bulanan berhasil dihapus permanen.", "success");
+      } catch (e) {
+        pushNotif(e?.message || String(e), "warning");
+      }
+    };
+
+    const askHapusBulanan = (s) => {
+      const b = branches.find((x) => x.id === s.branchId);
+      const inv = investors.find((i) => i.id === s.investorId);
+      confirmAsk({
+        title: "Hapus Laporan Bulanan",
+        message: `Yakin hapus laporan bulanan ${b?.name || s.branchId} untuk investor ${inv?.nama || "-"} bulan ${s.bulan} secara permanen? Data yang sudah dihapus tidak bisa dikembalikan.`,
+        onConfirm: () => hapusSetoranBulananPermanen(s.id)
+      });
     };
 
 
@@ -2886,7 +2971,15 @@ function useConfirm() {
                 React.createElement("span", { className: "badge-warn" }, "Menunggu Investor"),
                 React.createElement("button", { className: "btn-secondary btn-sm", onClick: () => konfirmBulanan(ex.id) }, "Tandai Selesai (Manual)")
               ),
-              ex?.status === "selesai" && React.createElement("span", { className: "badge-ok" }, "Dikonfirmasi", ex.confirmedBy ? ` (${ex.confirmedBy})` : "", " - ", ex.konfirmasiTs)
+              ex?.status === "selesai" && React.createElement(React.Fragment, null,
+                React.createElement("span", { className: "badge-ok" }, ex.locked ? "🔒 " : "🔓 ", "Dikonfirmasi", ex.confirmedBy ? ` (${ex.confirmedBy})` : "", " - ", ex.konfirmasiTs),
+                ex.locked
+                  ? React.createElement("button", { className: "btn-secondary btn-sm", onClick: () => bukaKunciBulanan(ex.id) }, "Buka Kunci")
+                  : React.createElement(React.Fragment, null,
+                      React.createElement("button", { className: "btn-secondary btn-sm", onClick: () => kunciUlangBulanan(ex.id) }, "Kunci Lagi"),
+                      React.createElement("button", { className: "btn-danger-sm", style: { marginLeft: 6 }, onClick: () => askHapusBulanan(ex) }, "Hapus")
+                    )
+              )
             )
           );
         })
@@ -5876,8 +5969,8 @@ function SettingAkun({ pushNotif }) {
 
     const konfirmBulananInvestor = (id) => {
       const all = S.get("setoranBulanan") || [];
-      S.set("setoranBulanan", all.map((s) => s.id === id ? { ...s, status: "selesai", konfirmasiTs: nowTs(), confirmedBy: "investor" } : s));
-      pushNotif?.("Laporan bulanan dikonfirmasi.", "success");
+      S.set("setoranBulanan", all.map((s) => s.id === id ? { ...s, status: "selesai", konfirmasiTs: nowTs(), confirmedBy: "investor", locked: true } : s));
+      pushNotif?.("Laporan bulanan dikonfirmasi & dikunci.", "success");
     };
 
     // Distribusi "dibatalkan" (fitur Retur di OwnerProduksiCK) dibuang di sini —
